@@ -703,6 +703,28 @@ cake_agg_discharge (cake_main_t *cm, cake_sched_t *cs, u32 pkt_len)
     }
 }
 
+/* Release what a flow's queued buffers hold at both levels, then free the ring.
+ * Bypassing this leaks agg->buffer_usage, which only ratchets up and
+ * eventually wedges the aggregate shut. */
+static_always_inline void
+cake_flow_discard (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
+		   cake_tin_t *tin, cake_flow_t *f)
+{
+  u32 queued = cake_flow_queue_len (f);
+
+  if (queued)
+    {
+      cake_agg_discharge (cm, cs, f->backlog_bytes);
+      cs->buffer_usage -= f->backlog_bytes;
+      cs->queued_buffers -= queued;
+      cs->dropped_pkts += queued;
+      tin->drops += queued;
+      f->backlog_bytes = 0;
+    }
+
+  cake_flow_ring_free (vm, f);
+}
+
 static_always_inline u8
 cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 			u64 now_ns, u32 thread_index)
