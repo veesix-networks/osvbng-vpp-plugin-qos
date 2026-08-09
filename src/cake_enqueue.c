@@ -51,11 +51,12 @@ format_cake_enqueue_trace (u8 *s, va_list *args)
 }
 
 static_always_inline void
-cake_flow_evict (vlib_main_t *vm, cake_tin_t *tin, u32 slot)
+cake_flow_evict (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
+		 cake_tin_t *tin, u32 slot)
 {
   cake_flow_t *ef = &tin->flows[slot];
 
-  cake_flow_ring_free (vm, ef);
+  cake_flow_discard (vm, cm, cs, tin, ef);
 
   if (ef->flow_state == CAKE_FLOW_SPARSE)
     {
@@ -223,7 +224,7 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (PREDICT_FALSE (flow_idx == ~0))
 	{
-	  cake_flow_evict (vm, tin, evict_slot);
+	  cake_flow_evict (vm, cm, cs, tin, evict_slot);
 	  tin->flow_tags[evict_slot] = tag;
 	  flow_idx = evict_slot;
 	  vlib_node_increment_counter (vm, node->node_index,

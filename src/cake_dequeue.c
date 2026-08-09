@@ -50,6 +50,7 @@ cake_flow_reclaim (vlib_main_t *vm, cake_tin_t *tin, cake_sched_t *cs,
   cobalt_queue_empty (f, cs->target_us, cs->p_dec, cs->interval_us, now_us);
 
   cake_flow_list_remove (list_head, list_tail, tin->flows, flow_idx);
+  /* Callers check the queue is empty, so there is no credit to release. */
   cake_flow_ring_free (vm, f);
 
   if (f->flow_state == CAKE_FLOW_SPARSE)
