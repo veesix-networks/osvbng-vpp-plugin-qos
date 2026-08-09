@@ -760,6 +760,31 @@ osvbng_qos_sched_init (vlib_main_t *vm)
 
 VLIB_INIT_FUNCTION (osvbng_qos_sched_init);
 
+/* sw_if_index values are recycled, so a scheduler outliving its interface
+ * blocks the next one to reuse the index: enable returns ENTRY_ALREADY_EXISTS
+ * while the stale entry, its feature config gone, shapes nothing. */
+static clib_error_t *
+cake_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
+{
+  cake_main_t *cm = &cake_main;
+
+  if (is_add)
+    return 0;
+
+  if (sw_if_index < vec_len (cm->sched_index_by_sw_if_index) &&
+      cm->sched_index_by_sw_if_index[sw_if_index] != ~0)
+    cake_sched_enable_disable (cm->vlib_main, sw_if_index, 0 /* disable */, 0,
+			       0, 0, 0, 0, 0, 0, 0, 0);
+
+  if (sw_if_index < vec_len (cm->agg_index_by_sw_if_index) &&
+      cm->agg_index_by_sw_if_index[sw_if_index] != ~0)
+    cake_aggregate_delete (cm->vlib_main, sw_if_index);
+
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (cake_sw_interface_add_del);
+
 VLIB_PLUGIN_REGISTER () = {
   .version = "6.0.0",
   .description = "osvbng QoS Scheduler Plugin (CAKE)",
