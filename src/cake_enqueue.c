@@ -296,6 +296,9 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (PREDICT_FALSE (cake_flow_queue_len (flow) >= CAKE_FLOW_RING_SIZE))
 	{
+	  /* Charged by aggregate admission above, and this buffer never
+	   * reaches a queue. */
+	  cake_agg_discharge (cm, cs, pkt_len);
 	  cobalt_queue_full (flow, cs->target_us, cs->p_inc,
 			     (u32) (vlib_time_now (vm) * 1e6));
 	  vlib_buffer_free_one (vm, bi0);
