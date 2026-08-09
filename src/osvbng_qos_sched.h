@@ -157,7 +157,7 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
   u64 rate_bytes_per_sec;
-  u64 rate_ns_per_byte;
+  u64 rate_ns_per_byte_scaled;
 
   u32 sw_if_index;
   u32 agg_index;
@@ -177,7 +177,7 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
   u64 rate_bytes_per_sec;
-  u64 rate_ns_per_byte;
+  u64 rate_ns_per_byte_scaled;
   u64 global_shaper_time_ns;
 
   u32 sw_if_index;
@@ -699,6 +699,25 @@ cake_agg_discharge (cake_main_t *cm, cake_sched_t *cs, u32 pkt_len)
     }
 }
 
+/* ns/byte in fixed point: plain integers truncate to 0 at and above 1e9 B/s
+ * and still round 3 Gbit/s up to 4 Gbit/s. 16 fractional bits hold the error
+ * under 0.01% to 100 Gbit/s. */
+#define CAKE_RATE_FRAC_BITS 16
+
+static_always_inline u64
+cake_rate_scaled (u64 rate_bytes_per_sec)
+{
+  return rate_bytes_per_sec > 0
+	   ? (1000000000ULL << CAKE_RATE_FRAC_BITS) / rate_bytes_per_sec
+	   : 0;
+}
+
+static_always_inline u64
+cake_cost_ns (u32 adj_len, u64 rate_ns_per_byte_scaled)
+{
+  return ((u64) adj_len * rate_ns_per_byte_scaled) >> CAKE_RATE_FRAC_BITS;
+}
+
 static_always_inline u8
 cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 			u64 now_ns, u32 thread_index)
@@ -708,7 +727,7 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 
   cake_aggregate_t *agg =
     pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-  u64 cost_ns = (u64) adj_len * agg->rate_ns_per_byte;
+  u64 cost_ns = cake_cost_ns (adj_len, agg->rate_ns_per_byte_scaled);
   u64 old_time, new_time;
 
   do

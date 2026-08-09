@@ -161,7 +161,8 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
       return 0;
     }
 
-  cs->global_shaper_time_ns += (u64) adj_len * cs->rate_ns_per_byte;
+  cs->global_shaper_time_ns +=
+    cake_cost_ns (adj_len, cs->rate_ns_per_byte_scaled);
   u64 max_shaper = now_ns + (u64) 150000000;
   if (cs->global_shaper_time_ns > max_shaper)
     cs->global_shaper_time_ns = max_shaper;
