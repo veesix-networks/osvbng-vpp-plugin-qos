@@ -177,8 +177,7 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
       cs->sw_if_index = sw_if_index;
       cs->sched_index = pool_index;
       cs->rate_bytes_per_sec = rate_bytes_per_sec;
-      cs->rate_ns_per_byte =
-	rate_bytes_per_sec > 0 ? (u64) 1e9 / rate_bytes_per_sec : 0;
+      cs->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
       cs->overhead_bytes = overhead_bytes;
       cs->atm_mode = atm_mode;
       cs->mpu = mpu;
@@ -384,8 +383,7 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
   agg->sw_if_index = sw_if_index;
   agg->agg_index = agg_idx;
   agg->rate_bytes_per_sec = rate_bytes_per_sec;
-  agg->rate_ns_per_byte =
-    rate_bytes_per_sec > 0 ? (u64) 1e9 / rate_bytes_per_sec : 0;
+  agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
 
   if (buffer_limit == 0)
