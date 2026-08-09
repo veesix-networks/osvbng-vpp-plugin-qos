@@ -259,10 +259,14 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  cake_aggregate_t *agg =
 	    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-	  u32 usage =
-	    __atomic_load_n (&agg->buffer_usage, __ATOMIC_RELAXED);
-	  if (PREDICT_FALSE (usage + pkt_len > agg->buffer_limit))
+	  /* Load-compare-add would let every worker admit against the same
+	   * under-limit read, overshooting by one packet per worker. */
+	  u32 prev =
+	    __atomic_fetch_add (&agg->buffer_usage, pkt_len, __ATOMIC_RELAXED);
+	  if (PREDICT_FALSE (prev + pkt_len > agg->buffer_limit))
 	    {
+	      __atomic_fetch_sub (&agg->buffer_usage, pkt_len,
+				  __ATOMIC_RELAXED);
 	      cobalt_queue_full (flow, cs->target_us, cs->p_inc,
 				 (u32) (vlib_time_now (vm) * 1e6));
 	      vlib_buffer_free_one (vm, bi0);
@@ -272,8 +276,6 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      vec_elt_at_index (agg->stats, thread_index)->backpressure_events++;
 	      continue;
 	    }
-	  __atomic_fetch_add (&agg->buffer_usage, pkt_len,
-			      __ATOMIC_RELAXED);
 	}
 
       if (PREDICT_FALSE (flow->flow_state == CAKE_FLOW_NONE))
