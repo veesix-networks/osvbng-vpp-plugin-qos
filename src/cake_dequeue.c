@@ -71,6 +71,46 @@ cake_flow_reclaim (vlib_main_t *vm, cake_tin_t *tin, cake_sched_t *cs,
   tin->flow_count--;
 }
 
+/* Walk state for one dispatch. The walk covers every active scheduler
+ * exactly once, starting from an arbitrary index and wrapping. */
+typedef struct
+{
+  uword start;
+  u8 wrapped;
+} cake_walk_t;
+
+static_always_inline uword
+cake_walk_first (uword *bm, uword from, cake_walk_t *w)
+{
+  uword si = clib_bitmap_next_set (bm, from);
+
+  /* Nothing at or after `from`: the whole set is below it, so start at the
+   * bottom with no wrap left to do. */
+  if (si == (uword) ~0)
+    si = clib_bitmap_first_set (bm);
+
+  w->start = si;
+  w->wrapped = 0;
+  return si;
+}
+
+static_always_inline uword
+cake_walk_next (uword *bm, cake_walk_t *w, uword si)
+{
+  si = clib_bitmap_next_set (bm, si + 1);
+
+  if (si == (uword) ~0 && !w->wrapped)
+    {
+      w->wrapped = 1;
+      si = clib_bitmap_first_set (bm);
+    }
+
+  if (w->wrapped && si != (uword) ~0 && si >= w->start)
+    return (uword) ~0;
+
+  return si;
+}
+
 static_always_inline u32
 cake_select_flow (cake_tin_t *tin)
 {
@@ -223,8 +263,15 @@ VLIB_NODE_FN (cake_dequeue_node)
   u32 n_aqm_drops = 0;
   u32 n_ecn_marks = 0;
 
+  /* Bitmap order is ascending pool index and stable, so starting at the
+   * bottom every dispatch makes a shared aggregate gate a strict priority:
+   * the first scheduler polled takes the credit, the rest find it shut. */
   uword si;
-  clib_bitmap_foreach (si, pt->active_bitmap)
+  cake_walk_t walk;
+
+  for (si = cake_walk_first (pt->active_bitmap, pt->walk_start, &walk);
+       si != (uword) ~0;
+       si = cake_walk_next (pt->active_bitmap, &walk, si))
     {
       if (budget == 0 || n_deactivate >= VLIB_FRAME_SIZE - 1)
 	break;
@@ -377,6 +424,9 @@ VLIB_NODE_FN (cake_dequeue_node)
 	shaper_exhausted:
 	  break;
 	}
+
+      if (sched_dequeued > 0)
+	pt->walk_start = si + 1;
 
       if (sched_dequeued > 0
 	  && PREDICT_FALSE (node->flags & VLIB_NODE_FLAG_TRACE))
