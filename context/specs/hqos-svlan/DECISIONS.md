@@ -103,6 +103,119 @@ rediscover it.
   covers the already-merged admission race and fixed-point rate change, neither
   of which any test has ever exercised. §9.1.
 
+## Phase 6 — post-implementation code review triage (2026-08-12)
+
+Three passes over `ae8ed7c..HEAD` and the osvbng control-plane branch:
+Claude bug hunt (`code-reviews/CLAUDE.md`), Codex spec compliance
+(`code-reviews/CODEX.md`), Codex protocol conformance
+(`code-reviews/CODEX-PROTOCOL.md`, the Gemini slot, run on Codex at the
+user's direction). Benchmark gate results in `PHASE6_VERIFICATION.md`.
+Both independent passes converged on the stale-round wedge and on the
+level/rate validation pair, which is the strongest signal in the set.
+
+### Accepted: round tags initialize to zero and wedge late-created or long-idle children
+- **Source:** CODEX-PROTOCOL #1 and CLAUDE CL-1, independently
+- **Severity:** CRITICAL — every deployment crosses day 25 of uptime
+- **Resolution:** Past 2^31 ms of uptime, a zero or >25-day-old round tag
+  sits in the *future* half-space of the F5-4 signed comparison, so the
+  refill never fires and the child runs on escape debt alone — a subscriber
+  provisioned on day 30 wedges after one or two packets. Fixed twice over:
+  both tags are now seeded from the current round at create
+  (`cake_drr_shared_init` takes `now_ns`; `cake_sched_enable_disable` seeds
+  `cs->drr.round`), and `cake_drr_round_refill_due` treats a tag leading by
+  more than `CAKE_DRR_ROUND_STALE_LEAD` (2^20 rounds, ~17 minutes — far
+  beyond any real worker skew, far short of the 2^31 wrap artifact) as
+  elapsed rather than future, so recovery does not depend on the seed. The
+  F5-4 invariant is preserved: a one-round lead still neither refills nor
+  rewinds. Harness: `test_stale_round_rebases`, 71 checks green.
+
+### Accepted: v2 handlers alias unknown levels to the port operation
+- **Source:** CODEX #1 and CLAUDE CL-6
+- **Severity:** HIGH — a level byte of 2 deleted the port tier
+- **Resolution:** All three v2 handlers (`_v2_create`, `_v2_delete`,
+  `_v2_update`) accept only `PORT` and `SVLAN` and return `INVALID_VALUE`
+  for anything else, before any mutation.
+
+### Accepted: a port could be updated to a rate beneath its S-VLANs
+- **Source:** CODEX #2 and CLAUDE CL-5
+- **Severity:** HIGH
+- **Resolution:** `cake_aggregate_update` now enforces the hierarchy
+  invariant from both sides: the existing child-above-parent check, plus a
+  barrier-time walk rejecting a port rate below any child's. The Go
+  `ValidateAggregates` guard only covers full config commits; the CLI and
+  direct API path needed the dataplane to refuse it.
+
+### Accepted: §4.7 cache-line deviation, as documentation
+- **Source:** CODEX #3
+- **Severity:** MEDIUM as raised; resolved as a spec amendment
+- **Resolution:** The finding is factually right that the code deviates from
+  §4.7's table and that no finding recorded it. The layout itself is kept:
+  `drr.effective_weight` is read on exactly one path — the refill inside the
+  CAS loop — by the worker about to write the word beside it, so cacheline3
+  is the right home and cacheline0 would put it on the hottest read-shared
+  line. §4.7 now carries the amendment instead of the code carrying a
+  regression.
+
+### Accepted: conf-handler shape change leaked the old dataplane objects (osvbng)
+- **Source:** CLAUDE CL-3
+- **Severity:** MEDIUM — a narrowed tag set kept shaping forever, a widened
+  one silently kept the old rate on the overlap
+- **Resolution:** `AggregateHandler.Apply` tears down the old revision's
+  objects before applying a new shape; same-shape revisions still update in
+  place. The already-exists-is-replay tolerance stays, since checkpoint
+  restore depends on it.
+
+### Accepted: capability probe cached its own failure (osvbng)
+- **Source:** CLAUDE CL-4
+- **Severity:** MEDIUM — a control plane started before its dataplane
+  refused S-VLAN configuration until process restart
+- **Resolution:** The `sync.Once` became a mutex-guarded probe that latches
+  only on an *answer* — a capabilities reply, or a dataplane that does not
+  carry the message. A channel that cannot be opened is retried on the next
+  use. Dataplane-restart staleness remains and is documented at the site.
+
+### Accepted: three small hardenings
+- **Source:** CLAUDE CL-8, CL-9, CL-10
+- **Severity:** LOW
+- **Resolution:** The two comments still describing the pre-F5-2 uncharged
+  escape now state the charged semantics (`cake_dequeue.c`, the
+  `cake_agg_dequeue_gate` refund). The derived `buffer_limit` saturates at
+  `~0U` instead of wrapping above ~229 Gbit/s. The CLI burst multiply is
+  widened to u64 so wrapped millisecond values cannot alias back into the
+  valid range.
+
+### Recorded, no code change: AQM re-entry while parent gates are closed
+- **Source:** CLAUDE CL-2
+- **Severity:** MEDIUM as a design inconsistency, LOW in measured effect
+- **Rationale:** The parent gates sit after `cobalt_should_drop`, so a
+  gate-blocked head packet re-enters the AQM per dispatch — the placement
+  the subscriber-level DRR check deliberately avoids. Bounded honestly:
+  COBALT's escalating actions are gated on `drop_next_us`, so state moves at
+  CoDel cadence, not dispatch rate; the §9.3 contended pair shows drops
+  *relocating* between enqueue overflow and AQM (236k total in both phases,
+  identical goodput), not net inflation; and AQM-draining a queue the gate
+  will not release is defensible queue management. What is genuinely wrong
+  is ECN accounting (a held packet can be re-marked and re-counted per CoDel
+  deadline) and that the af-packet rig cannot test whether unblock-time
+  over-drop exists. Restructuring the dequeue path to fix a
+  counter-accuracy issue, without a rig that can validate the behavioural
+  half, fails "do not spec what you cannot verify". Revisit with the
+  hardware/bngblaster rig; the analysis lives in CL-2.
+
+### Rejected: fix the per-packet cost floor on this branch
+- **Source:** CODEX-PROTOCOL #2, scope-corrected by CLAUDE CL-7
+- **Severity:** MEDIUM at 40-100 Gbit/s with minimum frames; <1% below
+  ~10 Gbit/s with real frame mixes
+- **Rationale:** The arithmetic is correct as reported — `cake_cost_ns`
+  floors each packet's cost and the error is systematic, 2.4% over rate at
+  100 Gbit/s / 64 B. But it is v1-shipped arithmetic
+  (`ae8ed7c:osvbng_qos_sched.h:709-723`), extracted unchanged into
+  `cake_shaper.h`; this branch neither introduced it nor widened its blast
+  radius, and the fix (per-thread fractional remainder, or folding fraction
+  into the gate word) is its own design with its own verification burden.
+  One feature per PR: filed as follow-up work alongside the batching debt,
+  not folded into a fairness branch at review time.
+
 ## Phase 3 — Codex adversarial critique (2026-08-12)
 
 Two findings raised, both verified against source before acceptance; each was

@@ -453,9 +453,20 @@ distinguishable from an ordinary drop.
 | Field | Cache line | Purpose |
 |---|---|---|
 | `level`, `parent_index`, `svlan_id`, `weight` | cacheline0 (read-mostly) | identity and hierarchy |
-| `drr.effective_weight` | cacheline0 (read-mostly) | the aggregate's own weight as a child, read per packet, written on config only |
+| `drr.effective_weight` | cacheline3, with the packed word | the aggregate's own weight as a child; see amendment below |
 | `active_weight` (`u64`), `n_active_children` (`u32`) | cacheline4 | activation atomics, written on activation transitions, read at refill |
 | `drr.round_deficit` | cacheline3 | packed `(round, biased deficit)` word — an S-VLAN's own deficit vs the port, CAS-written per packet |
+
+**Amended at Phase 6** (this table originally placed `drr.effective_weight`
+on cacheline0): the implementation keeps the whole
+`cake_drr_shared_child_t` on cacheline3. The weight is read on exactly one
+path — the refill inside `cake_drr_shared_reserve` — by the same worker that
+is about to CAS `round_deficit` beside it, so splitting the pair would touch
+two lines where one does; and parking it on cacheline0 would put a field
+that is semantically part of the CAS-contended object on the line every
+worker reads per packet. Raised as an unrecorded deviation by the Phase 6
+spec-compliance review (`code-reviews/CODEX.md` #3); accepted as the better
+layout and recorded here rather than reverted.
 
 The shipped layout is preserved exactly: `global_shaper_time_ns` on cacheline1,
 `buffer_usage` on cacheline2, per-thread stats out of line. Packing the new

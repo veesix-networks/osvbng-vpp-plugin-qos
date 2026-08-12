@@ -17,8 +17,8 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **All five §7 phases done.** DRR, harness (65 checks), the S-VLAN tier, the `_v2` API (v1 CRCs verified unchanged), and the osvbng control plane on `feat/hqos-svlan-control-plane` in that repo. Next: Phase 6 code review, and the open items in [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) |
-| Phase 6 | Code Review | Not started |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **All five §7 phases done.** DRR, harness, the S-VLAN tier, the `_v2` API (v1 CRCs verified unchanged), and the osvbng control plane on `feat/hqos-svlan-control-plane` in that repo. Open items in [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) |
+| Phase 6 | Code Review | **Complete** (2026-08-12) — Claude bug hunt + two Codex adversarial passes (spec compliance; protocol conformance in the Gemini slot, at user direction), artifacts in [code-reviews/](code-reviews/). §9.3 benchmark gate **passed** ([PHASE6_VERIFICATION.md](PHASE6_VERIFICATION.md), `tests/perf-rig.sh`): tier costs +1.0 clk/pkt enqueue / +5.3% dequeue at the hot point. Triage in DECISIONS.md "Phase 6": 7 findings accepted and fixed (incl. the CRITICAL stale-round-tag wedge both reviewers found independently), 1 recorded, 1 rejected as pre-existing v1 arithmetic. Harness 71 checks green; two-tier fairness re-verified post-fix (worst 0.30 pts) |
 
 ## Blocking prerequisites
 
@@ -135,51 +135,49 @@ Line numbers are on `feat/hqos-svlan-drr` as of ba1e335 (§7 Phases 1-2 done).
 
 ```
 Read context/PROCESS.md, then context/specs/hqos-svlan/README.md,
-IMPLEMENTATION_SPEC.md, DECISIONS.md and PHASE5_FINDINGS.md.
+IMPLEMENTATION_SPEC.md, DECISIONS.md, PHASE5_FINDINGS.md and
+PHASE6_VERIFICATION.md.
 
-Phase 5 implementation is COMPLETE across two repos:
+Phases 5 AND 6 are COMPLETE across two repos:
 
   osvbng-vpp-plugin-qos  feat/hqos-svlan-drr
-    §7 P1 DRR on the port tier          done, measured
-    §7 P2 tests/drr_harness.c           done, 65 checks
-    §7 P3 the S-VLAN tier               done, measured
-    §7 P4 the _v2 binary API            done, exercised via vat2
+    §7 P1-P4 DRR, harness, S-VLAN tier, _v2 API   done, measured
+    §9.3 benchmark gate (tests/perf-rig.sh)       passed
+    Phase 6 review + triage + fixes               done (71 harness checks)
 
   osvbng                 feat/hqos-svlan-control-plane
-    §7 P5 control plane                 done, builds and tests on linux
+    §7 P5 control plane + Phase 6 fixes           done, builds/tests on linux
 
-Phase 6 (multi-model code review) is next, per PROCESS.md.
+Phase 6 artifacts: code-reviews/{CLAUDE,CODEX,CODEX-PROTOCOL}.md, triage in
+DECISIONS.md "Phase 6", benchmark in PHASE6_VERIFICATION.md. Seven findings
+were accepted and fixed — the CRITICAL one was round tags initializing to
+zero, which wedged any child created past day 25 of uptime, found
+independently by both reviewers. One finding (per-packet cost floor at
+40-100G) was rejected as pre-existing v1 arithmetic and needs its own issue.
+CL-2 (AQM re-entry under closed gates) is recorded, unfixed, and needs a
+bottlenecked rig to evaluate.
 
-Before reviewing, read PHASE5_FINDINGS.md. F5-1 is a withdrawn finding: a
-standalone model predicted an 11-point fairness failure the dataplane does
-not have, and it briefly reversed a spec decision before measurement put it
-back. F5-2 to F5-4 are three real defects in the spec's design that the rig
-and harness found, all fixed. F5-5 is open and bounds what the rig can
-honestly measure.
+What remains before merge:
+- §9.4 containerlab suites 18/19 — needs a dataplane image and clab, not
+  runnable in this workspace.
+- qos #4/#5/#6/#7 merging in the stacked order
+  (fix/aggregate-shaper-correctness); this branch rebases if they change.
+- Session parentage: osvbng-vpp-plugin-ipoe #7, pppoe-control #3. All
+  measurement used plain VLAN sub-interfaces.
+- osvbng control plane has never met a live dataplane.
+- Follow-up issues to file: cost-floor precision (CODEX-PROTOCOL #2),
+  hot-path batching (two specs deep against Requirement #2).
 
-Open items a reviewer should weigh:
-- F5-5: the rig's load source is VPP's main-thread packet generator, which
-  cannot offer uniform load past roughly 20 children per tier. Above that,
-  measured "unfairness" is the generator. No fairness figure above that
-  scale should be claimed.
-- Quantisation against frame size is unmeasured. VPP's pg cannot vary frame
-  length within a stream, so only across-subscriber size mixes were tested.
-- Everything is main-thread only. Cross-worker DRR is harness-proven and
-  hardware-unproven.
-- Session-based validation still needs osvbng-vpp-plugin-ipoe #7 and
-  osvbng-vpp-plugin-pppoe-control #3. All measurement used plain VLAN
-  sub-interfaces.
-- The plugin branch still assumes qos #4/#5/#6/#7 merge. #6 conflicts with
-  #4/#5 if merged on its own; the stacked fix/aggregate-shaper-correctness
-  branch is the order that works.
-- osvbng control plane: the conf handler and southbound are written and
-  unit-tested, but nothing has been run against a live dataplane.
+Standing measurement bounds (PHASE5_FINDINGS.md): F5-5 caps honest fairness
+claims at ~20 children per tier on this rig; intra-subscriber frame-size
+quantisation unmeasured; everything main-thread only.
 
 Build and measure with:
   ../vpp                  VPP v26.06, the pinned DATAPLANE_VERSION
   ../osvbng-vpp           copy src/* into plugins/osvbng_qos_sched/ then
                           DOCKER_DEFAULT_PLATFORM=linux/amd64 make vpp-dev
   tests/fairness-rig.sh   VPP under pg load, per-subscriber shares
+  tests/perf-rig.sh       §9.3 clocks/packet phase pairs
   tests/CMakeLists.txt    cmake -S tests -B build/tests && ctest --test-dir build/tests
   osvbng                  golang:1.24 container; it does not build on darwin
 ```
