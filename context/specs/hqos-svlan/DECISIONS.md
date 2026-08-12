@@ -1,9 +1,13 @@
 # Decisions: hqos-svlan
 
-Phase 2 (Gemini refinement) has not run. Phase 3 (Codex adversarial critique)
-ran 2026-08-12; its findings were verified against source before acceptance and
-are recorded under "Phase 3". Phase 1 entries are decisions taken during
-drafting, recorded here so the review agents attack the reasoning rather than
+Phase 3 (Codex adversarial critique) ran 2026-08-12; findings under "Phase 3".
+Phase 2 ran 2026-08-12 with Claude Fable 5 substituting for Gemini (deep
+review: design vs VPP/DPDK practice, fairness under congestion, bufferbloat;
+artifact at `spec-reviews/CLAUDE.md`); its ten findings — every one verified
+against source in the review itself — were all accepted by the human and are
+recorded under "Phase 2". Phase 4 finalization folded both review rounds into
+the spec on 2026-08-12. Phase 1 entries are decisions taken during drafting,
+recorded here so the review agents attack the reasoning rather than
 rediscover it.
 
 ## Accepted
@@ -37,6 +41,11 @@ rediscover it.
   reset would permanently prevent full-size packets. Deficit accumulates, capped
   at `max(2 * quantum, CAKE_MAX_PKT_BYTES)`, reset to 0 on activation. Deficit,
   quantum and cap are all bytes. §4.4.
+- **Superseded in part by Phase 2 (F1):** eligibility is now `deficit > 0`
+  with the full `adj_len` subtracted and bounded debt carried, so the cap and
+  floor are burst smoothing, no longer load-bearing for progress. Activation
+  clamps `deficit = min(deficit, 0)` — idle earns nothing and forgives no
+  debt.
 
 ### Explicit weight is a multiplier, not a replacement
 - **Source:** Phase 1
@@ -62,6 +71,11 @@ rediscover it.
 - **Resolution:** Without it an idle child's unused quantum is lost every round.
   The escape fires only when a parent's virtual time is a full round behind the
   wall clock, which means genuine spare capacity. §4.4.
+- **Amended by Phase 2 (F5, F8):** the escape is consulted only after the
+  eligibility check or reserve refuses, so deficits stay honest through idle
+  periods; the comparison is written in addition form (u64 underflow at
+  boot); and the default aggregate burst drops to 10 ms because burst credit
+  is DRR-unarbitrated.
 
 ### Hierarchical DRR, accepting one new shared per-packet write
 - **Source:** Phase 1
@@ -154,6 +168,108 @@ recorded alongside the acceptances.
   charge drains. Per-worker credits with reconciliation changes the fairness
   semantics to fix a race the packed CAS removes outright, using a loop shape
   the codebase already ships.
+
+## Phase 2 — Claude Fable 5 deep review (2026-08-12)
+
+Ten findings, all verified against source within the review
+(`spec-reviews/CLAUDE.md`), all accepted by the human, all folded in at
+Phase 4. The review also confirmed clean — no spec change — the §4.9 charge
+transfer equality (attack item 3) and the structural refund pairing (attack
+item 2, arithmetic bound corrected by F7).
+
+### Accepted F1: `>= adj_len` admission deadlocks a child whose head packet exceeds the deficit cap
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** HIGH (CRITICAL consequence with jumbo/ATM or unsplit GSO)
+- **Resolution:** Refills clamp at the cap and the escape never fires under a
+  saturated parent, so MTU 9000 × `dsl-pppoe-atm` (`adj_len ≈ 9,976`) or an
+  unsplit GSO chain wedges the whole subscriber permanently. Replaced with
+  the discipline the plugin's own flow-level DRR (`cake_dequeue.c:317`) and
+  sch_cake use: eligible while `deficit > 0`, subtract full `adj_len`, carry
+  bounded debt. Local child becomes `i64`; shared word stores the deficit
+  biased by 2^31 (`CAKE_DRR_DEFICIT_BIAS`). Activation clamps
+  `min(deficit, 0)` so debt survives idle (a debt reset would let a sparse
+  child overshoot by `pkt/quantum`×). `CAKE_MAX_PKT_BYTES` fixed at 2048,
+  explicitly not load-bearing. §4.3–§4.5, §9.1.
+
+### Accepted F2: quantum arithmetic still overflows u64 for permitted configurations
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** HIGH
+- **Resolution:** `round_bytes * effective_weight` wraps at e.g. 25 Gbit/s
+  child × weight 1000 under a 100 Gbit/s port (3.9e19). Weight validated
+  1–256 at the API and commit time; quantum computed with a 128-bit
+  intermediate at refill (once per child per round). §4.3, §5.2, §5.3.
+
+### Accepted F3: activation atomics on cacheline0 reintroduce the 7c04b13 bounce for sparse traffic
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** MEDIUM
+- **Resolution:** Activation transitions track traffic, not config — a 50 pps
+  VoIP subscriber toggles per packet and a single-member S-VLAN propagates
+  each toggle to the port — invalidating the line every worker reads per
+  packet for gate cost and buffer limit. `active_weight` and
+  `n_active_children` move to their own cacheline4. §4.7.
+
+### Accepted F4: §10 hot-path cost claim understated by ~4 RMWs; enqueue-side RMWs run at offered rate
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** MEDIUM
+- **Resolution:** Honest count stated in §10: 3 RMWs on 2 hot lines
+  (shipped) → 7 on 5 (S-VLAN tier). Read-only overload filter added in front
+  of the fetch-add-verify pair at each level (stale read used only to reject
+  at a full queue — pre-#5 over-admission cannot return). New §9.3 benchmark
+  phase (port-only vs S-VLAN clocks) gates the Phase 3 merge. §4.10, §9.3,
+  §10.
+
+### Accepted F5: gate burst credit is DRR-unarbitrated; 25 ms default re-opens a walk-order window at congestion onset
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** MEDIUM
+- **Resolution:** Under sustained sub-saturation virtual time pins at
+  `now − burst_ns`, so the escape is continuously open and the first
+  `burst_ns × rate` bytes of every saturation onset are admitted in walk
+  order. Aggregate `burst_ns` default drops to 10 ms (range floor; also the
+  post-idle downstream burst budget); the escape moves after the
+  eligibility/reserve step so children enter onset with bounded deficits;
+  §9.1 gains cyclic-load and onset-convergence rows. §4.4, §8, §9.1.
+
+### Accepted F6: DRR check placement inside `cake_dequeue_one` unpinned; gate-style placement churns COBALT per blocked retry
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** MEDIUM
+- **Resolution:** A DRR-blocked child retries every polling dispatch —
+  1000× round frequency — and placed after the AQM each retry re-runs
+  `cobalt_should_drop` on the same head packet, escalating `codel_count` and
+  inflating `ecn_marks`. The step-2 check is specified to run before
+  `cobalt_should_drop` and the ECN mark, mutating nothing when blocked;
+  matches sch_cake under a closed shaper. Steps 3–5 keep AQM-before-gate so
+  COBALT drains under a closed gate. §4.5.
+
+### Accepted F9: defensive deactivation paths share the bitmap-clear mechanism with the weight-bearing site
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** MEDIUM
+- **Resolution:** `pool_is_free_index` (`cake_dequeue.c:232`) and
+  owner-mismatch (`:242`) route through the same `deactivate[]` array as
+  empty-detect. Weight moves only on empty-detect of a live, owned scheduler
+  and at teardown; the defensive paths clear the bit only — subtracting
+  there double-counts a completed teardown and collapses `W`. §9.1 gains a
+  teardown-race row. §4.9.
+
+### Accepted F7: refund-carry bound is per-worker, not per-packet
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** LOW
+- **Resolution:** One refund can be in flight per worker; transient ceiling
+  restated as `BIAS + cap + n_workers × max adj_len` (still ≪ 2^32) so the
+  §9.1 linearizability row asserts the correct invariant. §4.4.
+
+### Accepted F8: escape comparison underflows u64 at boot
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** LOW
+- **Resolution:** `now_ns - PERIOD` wraps in the first round after boot and
+  in the harness (stub clock starts at 0). Rewritten in addition form. §4.4.
+
+### Accepted F10: two §4.9/§4.4 wordings invited implementation mistakes
+- **Source:** CLAUDE (Phase 2)
+- **Severity:** LOW
+- **Resolution:** Backfill now states the port side is not decremented
+  (pre-backfill packets still discharge the port; a symmetric subtract
+  over-admits). `cake_drr_local_admit` relabelled "owner-local, no refund
+  obligation" — the refill mutates, so "read-only" was wrong. §4.4, §4.9.
 
 ## Rejected
 

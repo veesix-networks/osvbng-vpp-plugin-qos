@@ -14,9 +14,9 @@ pool-index order.
 | Phase | Description | Status |
 |-------|-------------|--------|
 | Phase 1 | Spec Draft | **Complete** |
-| Phase 2 | Spec Refinement (Gemini) | Not started |
+| Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
-| Phase 4 | Spec Finalization | Not started |
+| Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
 | Phase 5 | Implementation | Not started |
 | Phase 6 | Code Review | Not started |
 
@@ -50,6 +50,9 @@ compatible and #9 becomes redundant.
 - [IMPLEMENTATION_SPEC.md](IMPLEMENTATION_SPEC.md) — technical specification
 - [DECISIONS.md](DECISIONS.md) — Phase 1 decisions, recorded so review agents
   attack the reasoning rather than rediscover it
+- [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — Phase 2 deep review
+  (design vs VPP/DPDK practice, fairness under congestion, bufferbloat);
+  answers the four attack items below
 - [../hqos-qinq/IMPLEMENTATION_SPEC.md](../hqos-qinq/IMPLEMENTATION_SPEC.md) —
   the pre-pivot per-S-VLAN design; §4.7 gate and §4.9 lifecycle are inherited
 - [../hqos-qinq/DECISIONS.md](../hqos-qinq/DECISIONS.md) — records "Weighted DRR
@@ -78,31 +81,29 @@ compatible and #9 becomes redundant.
 Read context/PROCESS.md, then context/specs/hqos-svlan/README.md,
 IMPLEMENTATION_SPEC.md and DECISIONS.md.
 
-We are at Phase 3 complete (Codex adversarial critique, 2026-08-12). Two
-verified findings were folded in: the S-VLAN's shared deficit is now a packed
-(round, deficit) word reserved in one CAS with a bounded refund (§4.3-§4.5,
-§4.7), and backfill/detach transfer each moved member's outstanding buffer
-charge under the barrier (§4.9), with PR #5 promoted to hard prerequisite
-(§3). DECISIONS.md "Phase 3" records acceptances, scope corrections, and
-rejected alternatives.
+Phases 1-4 are complete (Codex adversarial critique and Claude Fable 5 deep
+review both 2026-08-12; finalization 2026-08-12 — all findings from both
+reviews accepted and folded in, every resolution recorded in DECISIONS.md).
 
-Next step is Phase 2 (Gemini) if run at all, else Phase 4 finalization. The
-things now most worth attacking:
+Next step is Phase 5 implementation, in the spec's §7 order (its Phase 1: DRR
+on the existing port tier, which closes issue #8 on its own). Blocked until
+the prerequisites merge: osvbng-vpp-plugin-ipoe #7 and
+osvbng-vpp-plugin-pppoe-control #3 (session parentage), qos #5 (buffer
+accounting — hard prerequisite), with qos #4, #6 and #7 strongly preferred
+first. Verify prerequisite status before starting.
 
-1. The progress argument in section 4.4. Wall-clock rounds exist to prevent a
-   deadlock where every child is blocked, nothing sends, and nothing unblocks.
-   Is that argument complete, and does the work-conserving escape interact
-   safely with the reserve CAS — in particular, can an escape admission ever
-   be refunded?
-2. The refund pairing in sections 4.4-4.5. A reserve may be refunded at most
-   once, only if it happened, and a refund may cross a round boundary. Is the
-   bounded-inaccuracy argument airtight under all three failure orderings?
-3. The charge transfer in section 4.9. It relies on cs->buffer_usage equalling
-   the member's outstanding parent charge at barrier time, which in turn
-   relies on PR #5 and on handed-off packets being uncharged. Does any path
-   violate that equality?
-4. The weight accounting in section 4.9. active_weight and n_active_children
-   are maintained at three sites with refcount propagation upward. Are the
-   transition points exhaustive, and is the backfill-on-create weight move
-   correct under concurrent activation?
+Review-derived details that are easy to miss when skimming the spec:
+
+1. DRR eligibility is deficit > 0 with the full adj_len subtracted and
+   bounded debt carried (biased packed word for the shared child); activation
+   clamps min(deficit, 0). §4.3-4.4.
+2. The step-2 DRR check runs before cobalt_should_drop and the ECN mark in
+   cake_dequeue_one; the escape is consulted only after the eligibility
+   check or reserve refuses, in addition form. §4.4-4.5.
+3. Weight moves only on empty-detect and teardown deactivations — never on
+   the defensive bitmap-clear paths (pool_is_free, owner-mismatch). §4.9.
+4. active_weight/n_active_children live on their own cache line (cacheline4);
+   weight is validated 1-256 and quantum uses a 128-bit intermediate; the
+   aggregate burst default is 10 ms; the enqueue admission has a read-only
+   overload filter in front of fetch-add-verify. §4.3, §4.7, §4.10, §8.
 ```

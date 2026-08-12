@@ -8,7 +8,7 @@ This file is the project-level state tracker. Every agent session should read th
 
 ## Current State
 
-VPP plugin for per-subscriber QoS — covering the full pipeline from policing through DSCP marking to CAKE-equivalent scheduling. The plugin skeleton is bootstrapped with the core file structure, binary API, enqueue/dequeue nodes, and CLI commands. Three specs exist: the full-qos spec (covering the complete QoS overhaul including policer enhancements, dynamic rates, DSCP marking, and scheduling), the cake-scheduler spec (deep dive into the CAKE algorithm adaptation for VPP), and the hqos-qinq spec (hierarchical QoS for QinQ deployments with per-S-VLAN aggregate shaping). The cake-scheduler spec has been through Codex (Phase 3) and Gemini (Phase 2) review — all findings accepted, spec finalized in Phase 4. The hqos-qinq spec is in Phase 1 (draft complete).
+VPP plugin for per-subscriber QoS — covering the full pipeline from policing through DSCP marking to CAKE-equivalent scheduling. The plugin skeleton is bootstrapped with the core file structure, binary API, enqueue/dequeue nodes, and CLI commands. Three specs exist: the full-qos spec (covering the complete QoS overhaul including policer enhancements, dynamic rates, DSCP marking, and scheduling), the cake-scheduler spec (deep dive into the CAKE algorithm adaptation for VPP), and the hqos-qinq spec (hierarchical QoS for QinQ deployments with per-S-VLAN aggregate shaping). The cake-scheduler spec has been through Codex (Phase 3) and Gemini (Phase 2) review — all findings accepted, spec finalized in Phase 4. A fourth spec, hqos-svlan, adds a per-S-VLAN aggregate tier with weighted DRR fairness at both aggregate tiers; it is finalized (Phase 4 complete, 2026-08-12) after a Codex adversarial critique and a Claude Fable 5 deep review, with implementation blocked on the session-parentage and aggregate-correctness PRs.
 
 ## Specs
 
@@ -17,6 +17,7 @@ VPP plugin for per-subscriber QoS — covering the full pipeline from policing t
 | [full-qos](specs/full-qos/) | Phase 4 complete (in osvbng-context) | Full QoS overhaul: configurable policer algorithms, dynamic ad-hoc rates, DSCP marking pipeline, live policy updates, show/oper commands, Prometheus metrics, and CAKE scheduling (Phase 5 of this spec) |
 | [cake-scheduler](specs/cake-scheduler/) | Phase 4 complete (spec finalized) | CAKE-equivalent per-subscriber scheduler: per-flow queuing, COBALT AQM, DRR, DiffServ tins, triple isolation, overhead compensation, token-bucket shaping. Codex (7 findings) + Gemini (11 findings) reviews — all accepted, 0 rejected. |
 | [hqos-qinq](specs/hqos-qinq/) | Phase 5 complete (implemented) | Two-level HQoS: per-port lockless aggregate shaper + per-subscriber CAKE. Auto-attach via interface hierarchy walk, atomic token bucket shared across all workers. Issue [#1](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/issues/1). |
+| [hqos-svlan](specs/hqos-svlan/) | Phase 4 complete (spec finalized) | Per-S-VLAN aggregate tier between subscriber CAKE and the port, plus child-driven weighted DRR (no pinning, no hot-path child iteration) so both aggregate tiers share rate fairly instead of serving in pool-index order. Issues [#8](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/issues/8)/[#1](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/issues/1). Codex critique (2 findings) + Claude Fable 5 deep review (10 findings) — all accepted. Implementation blocked on ipoe #7, pppoe-control #3 (session parentage) and qos PR #5 (hard prerequisite). |
 
 ## Spec Dependencies
 
@@ -25,13 +26,16 @@ graph TD
     FQ[full-qos<br/>Policers + DSCP + Dynamic Rates + Scheduling]
     CS[cake-scheduler<br/>CAKE algorithm deep dive for VPP]
     HQ[hqos-qinq<br/>Per-S-VLAN aggregate shaping]
+    HS[hqos-svlan<br/>S-VLAN tier + weighted DRR fairness]
 
     FQ --> CS
     CS --> HQ
+    HQ --> HS
 
     style FQ fill:#2da44e,color:#fff
     style CS fill:#2da44e,color:#fff
     style HQ fill:#2da44e,color:#fff
+    style HS fill:#2da44e,color:#fff
 ```
 
 Legend: green = spec finalized
@@ -75,6 +79,19 @@ Both specs are needed because:
 - **ECN marking uses incremental checksum:** `ip4_header_checksum_update()` for IPv4 1-byte change. IPv6 has no checksum
 - **Egress-only:** BNG controls the download bottleneck; upload bufferbloat is the CPE's problem
 
+### From hqos-svlan (Phase 4 finalization — Codex 2 findings + Claude Fable 5 10 findings, all accepted)
+
+- **Child-driven weighted DRR, no pinning:** each child carries its own deficit and refuses itself when spent; parents track only the active-weight sum, updated on activation transitions. Closes issue #8 without walk rotation (PR #9 becomes redundant)
+- **Eligibility is `deficit > 0` with bounded debt** (the plugin's own flow-DRR / sch_cake discipline): no packet size can stall a child — jumbo/ATM and unsplit GSO ride the debt mechanism; activation clamps `min(deficit, 0)` so idle earns nothing and forgives no debt
+- **Wall-clock 1 ms rounds:** replenishment never depends on packets moving, so the byte-clock deadlock class does not exist
+- **Shared S-VLAN deficit is one packed `(round, biased deficit)` word:** refill + admit + decrement in a single CAS mirroring the shipped gate; refund is a bounded fetch_add, paired iff the reserve succeeded
+- **Reserve before escape; aggregate burst default 10 ms:** gate burst credit is DRR-unarbitrated, so it is kept at the range floor and deficits stay honest through idle periods
+- **Activation atomics own a cache line:** activation frequency tracks sparse traffic (per packet for VoIP-class flows), not config — cacheline0 placement would reintroduce the 7c04b13 bounce
+- **DRR check runs before COBALT/ECN in cake_dequeue_one:** a blocked retry (per dispatch, 1000× round frequency) must mutate nothing
+- **Barrier-time weight and buffer-charge transfer on backfill/detach:** exact under PR #5's invariant (hard prerequisite); the port side is never decremented on backfill; weight moves only on empty-detect and teardown deactivations, never the defensive bitmap-clear paths
+- **Weight validated 1–256, quantum via 128-bit intermediate:** the evaluation-order rule alone still overflows u64 at large multipliers
+- **`_v2` messages + capabilities query:** CRC-safe evolution, one binapi call per session bring-up preserved
+
 ## Codebase State
 
 | Component | Exists | Notes |
@@ -99,3 +116,4 @@ The cake-scheduler spec is finalized (Phase 4 complete). All Codex findings acce
 2. **cake-scheduler Phase 6: Code review** — Post-implementation review by Codex and/or Gemini
 3. **hqos-qinq Phase 5: Implementation** — Aggregate lifecycle (under worker barrier), unified interleaved dequeue loop, draining state, explicit thread placement API
 4. **hqos-qinq Phase 6: Code review** — Post-implementation review
+5. **hqos-svlan Phase 5: Implementation** — blocked on osvbng-vpp-plugin-ipoe #7, osvbng-vpp-plugin-pppoe-control #3 (session parentage) and qos PR #5 (buffer accounting, hard prerequisite), with #4/#6/#7 strongly preferred first. Then the spec's §7 order: port-tier DRR (closes #8) → harness → S-VLAN tier → binary API → control plane
