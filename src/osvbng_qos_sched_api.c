@@ -199,11 +199,11 @@ vl_api_osvbng_cake_aggregate_dump_t_handler (
 
 
 static void
-vl_api_osvbng_cake_sched_enable_disable_v2_t_handler (
-  vl_api_osvbng_cake_sched_enable_disable_v2_t *mp)
+vl_api_osvbng_cake_sched_v2_enable_disable_t_handler (
+  vl_api_osvbng_cake_sched_v2_enable_disable_t *mp)
 {
   cake_main_t *cm = &cake_main;
-  vl_api_osvbng_cake_sched_enable_disable_v2_reply_t *rmp;
+  vl_api_osvbng_cake_sched_v2_enable_disable_reply_t *rmp;
   int rv;
 
   VALIDATE_SW_IF_INDEX (mp);
@@ -216,15 +216,15 @@ vl_api_osvbng_cake_sched_enable_disable_v2_t_handler (
     ntohl (mp->flags), ntohl (mp->weight));
 
   BAD_SW_IF_INDEX_LABEL;
-  REPLY_MACRO (VL_API_OSVBNG_CAKE_SCHED_ENABLE_DISABLE_V2_REPLY);
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_SCHED_V2_ENABLE_DISABLE_REPLY);
 }
 
 static void
-vl_api_osvbng_cake_aggregate_create_v2_t_handler (
-  vl_api_osvbng_cake_aggregate_create_v2_t *mp)
+vl_api_osvbng_cake_aggregate_v2_create_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_create_t *mp)
 {
   cake_main_t *cm = &cake_main;
-  vl_api_osvbng_cake_aggregate_create_v2_reply_t *rmp;
+  vl_api_osvbng_cake_aggregate_v2_create_reply_t *rmp;
   int rv;
 
   VALIDATE_SW_IF_INDEX (mp);
@@ -241,15 +241,15 @@ vl_api_osvbng_cake_aggregate_create_v2_t_handler (
       ntohl (mp->burst_ns), ntohl (mp->buffer_limit));
 
   BAD_SW_IF_INDEX_LABEL;
-  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_CREATE_V2_REPLY);
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_CREATE_REPLY);
 }
 
 static void
-vl_api_osvbng_cake_aggregate_delete_v2_t_handler (
-  vl_api_osvbng_cake_aggregate_delete_v2_t *mp)
+vl_api_osvbng_cake_aggregate_v2_delete_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_delete_t *mp)
 {
   cake_main_t *cm = &cake_main;
-  vl_api_osvbng_cake_aggregate_delete_v2_reply_t *rmp;
+  vl_api_osvbng_cake_aggregate_v2_delete_reply_t *rmp;
   int rv;
 
   VALIDATE_SW_IF_INDEX (mp);
@@ -261,15 +261,15 @@ vl_api_osvbng_cake_aggregate_delete_v2_t_handler (
     rv = cake_aggregate_delete (cm->vlib_main, ntohl (mp->sw_if_index));
 
   BAD_SW_IF_INDEX_LABEL;
-  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_DELETE_V2_REPLY);
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_DELETE_REPLY);
 }
 
 static void
-vl_api_osvbng_cake_aggregate_update_t_handler (
-  vl_api_osvbng_cake_aggregate_update_t *mp)
+vl_api_osvbng_cake_aggregate_v2_update_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_update_t *mp)
 {
   cake_main_t *cm = &cake_main;
-  vl_api_osvbng_cake_aggregate_update_reply_t *rmp;
+  vl_api_osvbng_cake_aggregate_v2_update_reply_t *rmp;
   int rv;
 
   VALIDATE_SW_IF_INDEX (mp);
@@ -277,10 +277,11 @@ vl_api_osvbng_cake_aggregate_update_t_handler (
   rv = cake_aggregate_update (cm->vlib_main, ntohl (mp->sw_if_index),
 			      mp->level, ntohs (mp->svlan_id),
 			      clib_net_to_host_u64 (mp->rate_bytes_per_sec),
-			      ntohl (mp->weight), ntohl (mp->buffer_limit));
+			      ntohl (mp->weight), ntohl (mp->burst_ns),
+			      ntohl (mp->buffer_limit));
 
   BAD_SW_IF_INDEX_LABEL;
-  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_UPDATE_REPLY);
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_UPDATE_REPLY);
 }
 
 static void

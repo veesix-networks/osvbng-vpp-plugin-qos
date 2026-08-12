@@ -145,7 +145,12 @@ define osvbng_cake_aggregate_details
 };
 
 /* ---------------------------------------------------------------------------
- * Two-tier messages.
+ * Two-tier messages, all named <object>_v2_<verb>.
+ *
+ * VPP upstream mixes the two forms - gre_tunnel_add_del_v2 sits beside
+ * gre_tunnel_v2_dump in the same file - because only the dump/details pairing
+ * is inferred from the name. One form throughout is easier to read than
+ * matching upstream's inconsistency.
  *
  * New messages rather than added fields: message CRCs are checked at runtime,
  * so extending a shipped message breaks every control plane built against it.
@@ -179,7 +184,7 @@ enumflag osvbng_cake_feature : u32
     @param burst_ns - idle credit ceiling, 10-150 ms, 0 for the default
     @param buffer_limit - max buffered bytes, 0 to derive from rate
 */
-autoreply define osvbng_cake_aggregate_create_v2
+autoreply define osvbng_cake_aggregate_v2_create
 {
   u32 client_index;
   u32 context;
@@ -200,7 +205,7 @@ autoreply define osvbng_cake_aggregate_create_v2
 
     Deleting a port with S-VLANs beneath it is refused; take those down first.
 */
-autoreply define osvbng_cake_aggregate_delete_v2
+autoreply define osvbng_cake_aggregate_v2_delete
 {
   u32 client_index;
   u32 context;
@@ -209,16 +214,17 @@ autoreply define osvbng_cake_aggregate_delete_v2
   u16 svlan_id;
 };
 
-/** \brief Change rate, weight or buffer limit in place
+/** \brief Change rate, weight, burst or buffer limit in place
     @param rate_bytes_per_sec - 0 to leave unchanged
     @param weight - 0 to leave unchanged
+    @param burst_ns - 0 to leave unchanged
     @param buffer_limit - 0 to leave unchanged
 
     Exists so a rate change is not delete-and-recreate, which would drop the
     aggregate out of its parent's active weight and take every member's
     attachment and outstanding buffer charge with it.
 */
-autoreply define osvbng_cake_aggregate_update
+autoreply define osvbng_cake_aggregate_v2_update
 {
   u32 client_index;
   u32 context;
@@ -227,6 +233,7 @@ autoreply define osvbng_cake_aggregate_update
   u16 svlan_id;
   u64 rate_bytes_per_sec;
   u32 weight;
+  u32 burst_ns;
   u32 buffer_limit;
 };
 
@@ -281,7 +288,7 @@ define osvbng_cake_aggregate_v2_details
     declared control-plane hot path and a second round trip per bring-up is
     not affordable.
 */
-autoreply define osvbng_cake_sched_enable_disable_v2
+autoreply define osvbng_cake_sched_v2_enable_disable
 {
   u32 client_index;
   u32 context;

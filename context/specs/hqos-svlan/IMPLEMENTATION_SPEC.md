@@ -639,31 +639,39 @@ New messages; existing ones are retained unchanged so CRCs stay valid for
 current control planes.
 
 ```
-osvbng_cake_aggregate_create_v2 {
-  u32 sw_if_index;          /* port */
+osvbng_cake_aggregate_v2_create {
+  u32 sw_if_index;          /* port, for both levels */
   u8  level;                /* 0 = port, 1 = svlan */
   u16 svlan_id;             /* level 1 only */
   u16 svlan_id_end;         /* range end, == svlan_id for a single tag */
   u64 rate_bytes_per_sec;
   u32 weight;               /* multiplier, 0 or 1 = default */
-  u32 burst_ns;
+  u32 burst_ns;             /* 10-150 ms, 0 = default */
   u32 buffer_limit;         /* 0 = derive from rate */
 }
-osvbng_cake_aggregate_delete_v2 { u32 sw_if_index; u8 level; u16 svlan_id; }
-osvbng_cake_aggregate_update    { u32 sw_if_index; u8 level; u16 svlan_id;
+osvbng_cake_aggregate_v2_delete { u32 sw_if_index; u8 level; u16 svlan_id; }
+osvbng_cake_aggregate_v2_update { u32 sw_if_index; u8 level; u16 svlan_id;
                                   u64 rate_bytes_per_sec; u32 weight;
-                                  u32 buffer_limit; }
-osvbng_cake_aggregate_dump_v2   { u32 sw_if_index; }
-osvbng_cake_aggregate_details_v2 { ... level, parent_sw_if_index, svlan_id,
-                                   weight, active_weight, n_active_children,
+                                  u32 burst_ns; u32 buffer_limit; }
+osvbng_cake_aggregate_v2_dump   { u32 sw_if_index; }
+osvbng_cake_aggregate_v2_details { ... level, parent_sw_if_index, svlan_id,
+                                   weight, burst_ns, effective_weight,
+                                   active_weight, n_active_children,
                                    shaped_pkts, shaped_bytes, backpressure,
                                    drr_blocked, parent_blocked ... }
-osvbng_cake_sched_enable_disable_v2 { ...v1 fields..., u32 weight; }
+osvbng_cake_sched_v2_enable_disable { ...v1 fields..., u32 weight; }
 osvbng_cake_capabilities { }  /* -> version, max_levels, features bitmap */
 ```
 
-`weight` is validated to 1–256 wherever it appears (`create_v2`, `update`,
-`sched _v2`); 0 means default. The bound is what §4.3's overflow guard relies
+Every two-tier message is named `<object>_v2_<verb>`. VPP upstream mixes the
+two forms — `gre_tunnel_add_del_v2` sits beside `gre_tunnel_v2_dump` in one
+file, because only the dump/details pairing is inferred from the name — but
+one form throughout reads better than matching that inconsistency.
+
+`weight` is validated to 1–256 wherever it appears (`v2_create`, `v2_update`,
+`sched_v2`); 0 means default. `burst_ns` is validated to 10–150 ms in both
+`v2_create` and `v2_update`: an aggregate's burst is configurable for its
+whole life, not only at creation. The bound is what §4.3's overflow guard relies
 on, so the handlers reject rather than clamp.
 
 **Why `_v2` on the scheduler message rather than a separate set-weight call.**

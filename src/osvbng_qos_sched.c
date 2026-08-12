@@ -777,7 +777,8 @@ cake_aggregate_delete (vlib_main_t *vm, u32 sw_if_index)
   return 0;
 }
 
-/* Change rate, weight or buffer limit in place.
+/* Change rate, weight, burst or buffer limit in place. Any field left zero
+ * keeps its current value.
  *
  * This exists so a rate change is not delete-and-recreate, which would drop
  * the child out of its parent's W and back in, and would take every member's
@@ -787,7 +788,7 @@ cake_aggregate_delete (vlib_main_t *vm, u32 sw_if_index)
 int
 cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
 		       u16 svlan_id, u64 rate_bytes_per_sec, u32 weight,
-		       u32 buffer_limit)
+		       u32 burst_ns, u32 buffer_limit)
 {
   cake_main_t *cm = &cake_main;
   cake_aggregate_t *agg, *port;
@@ -795,6 +796,10 @@ cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
   u64 old_weight, new_weight;
 
   if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (burst_ns && (burst_ns < CAKE_AGG_BURST_NS_MIN ||
+		   burst_ns > CAKE_AGG_BURST_NS_MAX))
     return VNET_API_ERROR_INVALID_VALUE;
 
   if (level == CAKE_AGG_LEVEL_SVLAN && svlan_id >= CAKE_SVLAN_MAX)
@@ -845,6 +850,8 @@ cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
     }
   if (weight)
     agg->weight = weight;
+  if (burst_ns)
+    agg->burst_ns = burst_ns;
   if (buffer_limit)
     agg->buffer_limit = buffer_limit;
 
@@ -919,13 +926,14 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 			      CAKE_WEIGHT_MAX);
 
   u32 burst_ns = burst_ms * 1000000;
-
   int rv;
+
   if (is_update)
     rv = cake_aggregate_update (
       vm, sw_if_index,
       svlan_id != ~0 ? CAKE_AGG_LEVEL_SVLAN : CAKE_AGG_LEVEL_PORT,
-      svlan_id != ~0 ? (u16) svlan_id : 0, rate_kbps * 1000 / 8, weight, 0);
+      svlan_id != ~0 ? (u16) svlan_id : 0, rate_kbps * 1000 / 8, weight,
+      burst_ns, 0);
   else if (svlan_id != ~0)
     {
       if (svlan_id_end < svlan_id || svlan_id_end >= CAKE_SVLAN_MAX)

@@ -356,7 +356,7 @@ int cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
 				 u32 burst_ns, u32 buffer_limit);
 int cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
 			   u16 svlan_id, u64 rate_bytes_per_sec, u32 weight,
-			   u32 buffer_limit);
+			   u32 burst_ns, u32 buffer_limit);
 int cake_svlan_aggregate_delete (vlib_main_t *vm, u32 sw_if_index,
 				 u16 svlan_id);
 void cake_sched_resolve_attachment (cake_main_t *cm, cake_sched_t *cs);
