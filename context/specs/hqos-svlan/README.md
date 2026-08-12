@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **§7 Phases 2-4 done** — harness (65 checks), the S-VLAN tier, and the `_v2` binary API. All v1 message CRCs verified unchanged. Next: §7 Phase 5, the osvbng control plane |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **All five §7 phases done.** DRR, harness (65 checks), the S-VLAN tier, the `_v2` API (v1 CRCs verified unchanged), and the osvbng control plane on `feat/hqos-svlan-control-plane` in that repo. Next: Phase 6 code review, and the open items in [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) |
 | Phase 6 | Code Review | Not started |
 
 ## Blocking prerequisites
@@ -137,50 +137,49 @@ Line numbers are on `feat/hqos-svlan-drr` as of ba1e335 (§7 Phases 1-2 done).
 Read context/PROCESS.md, then context/specs/hqos-svlan/README.md,
 IMPLEMENTATION_SPEC.md, DECISIONS.md and PHASE5_FINDINGS.md.
 
-Spec phases 1-4 complete. Phase 5 implementation on `feat/hqos-svlan-drr`:
+Phase 5 implementation is COMPLETE across two repos:
 
-- §7 Phase 1 (DRR on the port tier)   done, measured
-- §7 Phase 2 (tests/drr_harness.c)    done, 65 checks
-- §7 Phase 3 (the S-VLAN tier)        done, measured
-- §7 Phase 4 (binary API)             done, exercised via vat2
-- §7 Phase 5 (osvbng control plane)   NEXT. Nothing of it exists.
+  osvbng-vpp-plugin-qos  feat/hqos-svlan-drr
+    §7 P1 DRR on the port tier          done, measured
+    §7 P2 tests/drr_harness.c           done, 65 checks
+    §7 P3 the S-VLAN tier               done, measured
+    §7 P4 the _v2 binary API            done, exercised via vat2
 
-The API is frozen at Phase 4's exit, which is what unblocks the control
-plane. All twelve v1 message CRCs are verified unchanged against `main`;
-twelve new messages are added. `osvbng_cake_capabilities` reports
-version 3, max_levels 2, weight 1-256, and a feature bitmap.
+  osvbng                 feat/hqos-svlan-control-plane
+    §7 P5 control plane                 done, builds and tests on linux
 
-This workspace builds and runs the plugin. Use it:
+Phase 6 (multi-model code review) is next, per PROCESS.md.
 
+Before reviewing, read PHASE5_FINDINGS.md. F5-1 is a withdrawn finding: a
+standalone model predicted an 11-point fairness failure the dataplane does
+not have, and it briefly reversed a spec decision before measurement put it
+back. F5-2 to F5-4 are three real defects in the spec's design that the rig
+and harness found, all fixed. F5-5 is open and bounds what the rig can
+honestly measure.
+
+Open items a reviewer should weigh:
+- F5-5: the rig's load source is VPP's main-thread packet generator, which
+  cannot offer uniform load past roughly 20 children per tier. Above that,
+  measured "unfairness" is the generator. No fairness figure above that
+  scale should be claimed.
+- Quantisation against frame size is unmeasured. VPP's pg cannot vary frame
+  length within a stream, so only across-subscriber size mixes were tested.
+- Everything is main-thread only. Cross-worker DRR is harness-proven and
+  hardware-unproven.
+- Session-based validation still needs osvbng-vpp-plugin-ipoe #7 and
+  osvbng-vpp-plugin-pppoe-control #3. All measurement used plain VLAN
+  sub-interfaces.
+- The plugin branch still assumes qos #4/#5/#6/#7 merge. #6 conflicts with
+  #4/#5 if merged on its own; the stacked fix/aggregate-shaper-correctness
+  branch is the order that works.
+- osvbng control plane: the conf handler and southbound are written and
+  unit-tested, but nothing has been run against a live dataplane.
+
+Build and measure with:
   ../vpp                  VPP v26.06, the pinned DATAPLANE_VERSION
   ../osvbng-vpp           copy src/* into plugins/osvbng_qos_sched/ then
                           DOCKER_DEFAULT_PLATFORM=linux/amd64 make vpp-dev
-                          (omit VPP_DEV_TARGET to rebuild the vat2 plugin too)
   tests/fairness-rig.sh   VPP under pg load, per-subscriber shares
   tests/CMakeLists.txt    cmake -S tests -B build/tests && ctest --test-dir build/tests
-
-Read PHASE5_FINDINGS.md first. F5-1 is a worked example of a standalone
-model predicting a fairness failure the dataplane does not have. F5-2 to
-F5-4 are three real defects the rig and harness found in the spec's design.
-F5-5 bounds what the rig can honestly measure - roughly 20 children per
-tier, because the main-thread packet generator cannot offer uniform load
-beyond that.
-
-Phase 5 work, from §6:
-- pkg/vpp/binapi/osvbng_qos_sched/ regenerated from the new API JSON
-- pkg/config/qos_aggregate.go: the `qos-aggregates` schema of §5.3, with
-  commit-time validation - interface exists, S-VLAN sets disjoint per port,
-  child rate not above parent, weight 1-256
-- pkg/conf/handlers/qos_aggregate.go: conf.Handler with Dependencies() on
-  the interface path
-- pkg/southbound/vpp/qos.go: ApplyAggregate/RemoveAggregate/UpdateAggregate,
-  ApplyScheduler moved to _v2 carrying weight, re-assert on
-  ENTRY_ALREADY_EXISTS
-- pkg/handlers/show/qos/aggregate.go: CLI plus
-  telemetry.RegisterMetric[southbound.AggregateState]
-- pkg/svcgroup/apply.go: pass the service-group weight to ApplyScheduler
-
-Note osvbng's own conventions differ from this repo's: Conventional Commits
-with release-please, no blocking I/O under locks, O(1) lookups on the
-session path. Read osvbng/docs/contributing/guidelines.md before starting.
+  osvbng                  golang:1.24 container; it does not build on darwin
 ```
