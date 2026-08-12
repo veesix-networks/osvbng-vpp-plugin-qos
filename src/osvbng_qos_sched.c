@@ -178,6 +178,14 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
       cs->sched_index = pool_index;
       cs->rate_bytes_per_sec = rate_bytes_per_sec;
       cs->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
+
+      /* Weight defaults to the subscriber's own configured rate, so with no
+       * configuration at all a 100 Mbit/s subscriber gets ten times the
+       * congested share of a 10 Mbit/s one. The operator multiplier needs the
+       * _v2 message and lands with the API phase. Floored at 1 so a
+       * rate-0 scheduler still divides. */
+      cs->drr.effective_weight =
+	rate_bytes_per_sec > 0 ? rate_bytes_per_sec : 1;
       cs->overhead_bytes = overhead_bytes;
       cs->atm_mode = atm_mode;
       cs->mpu = mpu;
@@ -299,6 +307,12 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
       clib_mem_free (cs->tins);
       cs->tins = NULL;
 
+      /* Teardown deactivation: the second of the two weight-bearing sites.
+       * A dispatch mid-walk may still clear this scheduler's activity bit
+       * defensively afterwards; that path deliberately moves no weight, so
+       * this subtraction happens exactly once. */
+      cake_sched_drr_deactivate (cm, cs);
+
       for (u32 ti = 0; ti < vec_len (cm->per_thread); ti++)
 	{
 	  cake_per_thread_t *pt = vec_elt_at_index (cm->per_thread, ti);
@@ -384,6 +398,7 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
   agg->agg_index = agg_idx;
   agg->rate_bytes_per_sec = rate_bytes_per_sec;
   agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
+  agg->drr_round_bytes = cake_drr_round_bytes (rate_bytes_per_sec);
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
 
   if (buffer_limit == 0)
@@ -531,6 +546,45 @@ cake_aggregate_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 		       "backpressure %llu",
 		       agg->buffer_usage, agg->buffer_limit, shaped_pkts,
 		       shaped_bytes, backpressure_events);
+
+      /* Workers keep moving these while the CLI reads them; the display is a
+       * snapshot, not a barrier-consistent view. */
+      u64 active_weight =
+	__atomic_load_n (&agg->active_weight, __ATOMIC_RELAXED);
+      u32 n_active =
+	__atomic_load_n (&agg->n_active_children, __ATOMIC_RELAXED);
+
+      vlib_cli_output (vm, "    active %u children, W %llu, round %llu bytes",
+		       n_active, active_weight, agg->drr_round_bytes);
+
+      /* The aggregate holds no child list - arbitration is child-driven, so
+       * nothing on the hot path ever walks one. Rebuilding it here is a CLI
+       * cost only. */
+      cake_sched_t *cs;
+      pool_foreach (cs, cm->schedulers)
+	{
+	  if (cs->aggregate_index != agg->agg_index)
+	    continue;
+
+	  /* Share is what this child earns of a saturated parent right now.
+	   * An idle child is not in W and earns nothing until it activates. */
+	  u64 share_x10 =
+	    (cs->drr.active && active_weight)
+	      ? (cs->drr.effective_weight * 1000) / active_weight
+	      : 0;
+
+	  vlib_cli_output (
+	    vm,
+	    "      %U: weight %llu, share %llu.%llu%%, %s, "
+	    "quantum %llu bytes, deficit %lld, "
+	    "drr_blocked %llu, parent_blocked %llu",
+	    format_vnet_sw_if_index_name, vnet_get_main (), cs->sw_if_index,
+	    cs->drr.effective_weight, share_x10 / 10, share_x10 % 10,
+	    cs->drr.active ? "active" : "idle",
+	    cake_drr_quantum (agg->drr_round_bytes, cs->drr.effective_weight,
+			      active_weight),
+	    cs->drr.deficit, cs->drr_blocked, cs->parent_blocked);
+	}
 
       found++;
     }

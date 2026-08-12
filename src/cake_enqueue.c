@@ -105,6 +105,7 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   u32 n_enqueued = 0;
   u32 n_dropped = 0;
+  u32 n_agg_backpressure = 0;
 
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   vlib_get_buffers (vm, from, bufs, n_left);
@@ -274,6 +275,7 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      tin->drops++;
 	      n_dropped++;
 	      vec_elt_at_index (agg->stats, thread_index)->backpressure_events++;
+	      n_agg_backpressure++;
 	      continue;
 	    }
 	}
@@ -347,6 +349,12 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    tin->hosts[flow->dst_host_idx].bulk_flow_count++;
 	}
 
+      /* 0->1 active: this scheduler now competes for its parent's rate, so
+       * its weight joins the parent's active sum. Idempotent - the common
+       * case is an already-active scheduler and returns without touching the
+       * parent. */
+      cake_sched_drr_activate (cm, cs);
+
       if (!clib_bitmap_get (cm->per_thread[thread_index].active_bitmap,
 			    cs->sched_index))
 	{
@@ -388,6 +396,10 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			       n_enqueued);
   vlib_node_increment_counter (vm, node->node_index,
 			       CAKE_ERROR_DROPPED_OVERFLOW, n_dropped);
+  if (n_agg_backpressure)
+    vlib_node_increment_counter (vm, node->node_index,
+				 CAKE_ERROR_AGG_BACKPRESSURE,
+				 n_agg_backpressure);
 
   return frame->n_vectors;
 }

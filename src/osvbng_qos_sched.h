@@ -28,6 +28,8 @@
 #include <vnet/buffer.h>
 #include <vlib/vlib.h>
 
+#include <osvbng_qos_sched/cake_drr.h>
+
 #define CAKE_BUFFER_F_SCHEDULED VNET_BUFFER_F_AVAIL1
 
 #define CAKE_QUEUES	  1024
@@ -50,9 +52,15 @@
 #define CAKE_INTERVAL_US_DEFAULT  100000
 #define CAKE_REC_INV_SQRT_CACHE	  16
 
-/* Idle credit ceiling for an aggregate shaper. 25 ms sits inside the
- * 10-125 ms range commodity shapers use. */
-#define CAKE_AGG_BURST_NS	  (25ULL * 1000000ULL)
+/* Idle credit ceiling for an aggregate shaper, at the floor of the 10-125 ms
+ * range commodity shapers use. Burst credit is DRR-unarbitrated: under
+ * sustained sub-saturation virtual time pins at now - CAKE_AGG_BURST_NS, the
+ * work-conserving escape stays continuously open, and the first
+ * burst x rate bytes of every saturation onset are admitted in walk order.
+ * A wider window buys back the very starvation this tier exists to remove,
+ * and it is also the post-idle line-rate burst released into the access
+ * network. */
+#define CAKE_AGG_BURST_NS	  (10ULL * 1000000ULL)
 
 #define CAKE_HOSTS	  256
 #define CAKE_HOSTS_MASK	  (CAKE_HOSTS - 1)
@@ -162,6 +170,7 @@ typedef struct
 
   u64 rate_bytes_per_sec;
   u64 rate_ns_per_byte_scaled;
+  u64 drr_round_bytes;
 
   u32 sw_if_index;
   u32 agg_index;
@@ -174,6 +183,17 @@ typedef struct
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline2);
   u32 buffer_usage;
+
+  /* Activation transitions track traffic, not configuration: a scheduler
+   * deactivates the moment its queues drain and re-activates on the next
+   * packet, so a 50 pps VoIP-only subscriber toggles once per packet. Sharing
+   * cacheline0 these writes would invalidate - at sparse-traffic rate - the
+   * line every worker reads per packet for rate_ns_per_byte_scaled and
+   * buffer_limit. The two share a line with each other because they are
+   * always written together. */
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline3);
+  u64 active_weight;
+  u32 n_active_children;
 } cake_aggregate_t;
 
 typedef struct
@@ -214,7 +234,19 @@ typedef struct
   u64 dequeued_bytes;
   u64 dropped_pkts;
 
+  /* Read together on the dequeue path: resolve the parent, then test this
+   * scheduler's share of it. Owner-thread-local end to end - a scheduler has
+   * exactly one owner and only that thread dequeues it - so the deficit costs
+   * no shared cache line. */
   u32 aggregate_index;
+  cake_drr_child_t drr;
+
+  /* Dispatches deferred, not packets: the walk leaves the scheduler on either
+   * outcome and retries next dispatch. Counted apart because they mean
+   * different things - drr_blocked is "your siblings are using the capacity",
+   * parent_blocked is "the parent is full". */
+  u64 drr_blocked;
+  u64 parent_blocked;
 } cake_sched_t;
 
 typedef struct
@@ -742,6 +774,71 @@ cake_flow_discard (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
     }
 
   cake_flow_ring_free (vm, f);
+}
+
+/* Bind the dependency-free DRR core to a scheduler and the aggregate it
+ * competes in. A scheduler with no aggregate has nothing to arbitrate
+ * against, so it admits without charging. */
+static_always_inline cake_drr_admit_t
+cake_sched_drr_admit (cake_main_t *cm, cake_sched_t *cs, u64 now_ns)
+{
+  if (cs->aggregate_index == ~0)
+    return CAKE_DRR_ESCAPE;
+
+  cake_aggregate_t *agg =
+    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
+
+  return cake_drr_local_admit (&cs->drr, agg->drr_round_bytes,
+			       &agg->active_weight,
+			       &agg->global_shaper_time_ns, now_ns);
+}
+
+/* Weight accounting, at exactly three sites: activation on enqueue,
+ * empty-detect deactivation on dequeue, and teardown. Both directions are
+ * guarded by the child's own flag, which is owner-thread-local; only the
+ * parent's counters are atomic, and they move on activation transitions
+ * rather than per packet.
+ *
+ * The defensive deactivations in the dequeue walk - pool-free and
+ * owner-mismatch - must NOT call this. They clear the activity bit for a
+ * scheduler whose teardown already ran, and subtracting there double-counts:
+ * active_weight underflows and every sibling's quantum collapses. */
+static_always_inline void
+cake_sched_drr_activate (cake_main_t *cm, cake_sched_t *cs)
+{
+  if (PREDICT_TRUE (cs->drr.active))
+    return;
+
+  cake_drr_child_activate (&cs->drr);
+
+  if (cs->aggregate_index == ~0)
+    return;
+
+  cake_aggregate_t *agg =
+    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
+
+  __atomic_fetch_add (&agg->active_weight, cs->drr.effective_weight,
+		      __ATOMIC_RELAXED);
+  __atomic_fetch_add (&agg->n_active_children, 1, __ATOMIC_RELAXED);
+}
+
+static_always_inline void
+cake_sched_drr_deactivate (cake_main_t *cm, cake_sched_t *cs)
+{
+  if (!cs->drr.active)
+    return;
+
+  cs->drr.active = 0;
+
+  if (cs->aggregate_index == ~0)
+    return;
+
+  cake_aggregate_t *agg =
+    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
+
+  __atomic_fetch_sub (&agg->active_weight, cs->drr.effective_weight,
+		      __ATOMIC_RELAXED);
+  __atomic_fetch_sub (&agg->n_active_children, 1, __ATOMIC_RELAXED);
 }
 
 static_always_inline u8
