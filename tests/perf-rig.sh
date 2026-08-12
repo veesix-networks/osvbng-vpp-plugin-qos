@@ -5,11 +5,8 @@
 #
 # Clocks/Packet phase pair (IMPLEMENTATION_SPEC.md section 9.3): identical
 # offered load through a port-only aggregate and through port + S-VLAN tier,
-# per-node cycle readout for the CAKE enqueue and dequeue nodes. Section 10
-# prices the S-VLAN tier at four additional shared-line RMWs per admitted
-# packet - two on the dequeue side (gate CAS, reserve CAS), two on the
-# enqueue side (buffer fetch_add, discharge fetch_sub) - taking 3 RMWs on 2
-# hot lines to 7 on 5. This rig turns that into cycles.
+# per-node cycle readout for the CAKE enqueue and dequeue nodes. This turns
+# section 10's RMW pricing (3 on 2 hot lines -> 7 on 5) into cycles.
 #
 # Runs INSIDE the osvbng-vpp builder container, against the tree in the /work
 # volume. From ../osvbng-vpp with the plugin already built by `make vpp-dev`:
@@ -18,20 +15,10 @@
 #     -v "$PWD/../osvbng-vpp-plugin-qos/tests/perf-rig.sh":/rig.sh:ro \
 #     osvbng-vpp-builder:v26.06 bash /rig.sh
 #
-# Each phase runs two load profiles:
-#
-#   uncontended  offered well below every shaper rate: every packet is
-#                admitted on its first gate attempt, so the delta between
-#                phases is the pure admission-path cost of the extra tier.
-#   saturated    offered far above the port rate: the fairness-rig regime,
-#                where dequeue cycles include gate-refused retries and
-#                enqueue cycles include the overflow path.
-#
-# What the numbers legitimately claim (same boundary as perf/README.md in
-# osvbng-vpp): same-box, relative, containerized, main thread only. The
-# cake-dequeue node is an always-polling INPUT node, so its clocks/packet
-# amortizes empty polls over emitted packets - compare it only within the
-# same load profile, never across profiles.
+# Validity boundary is perf/README.md's in osvbng-vpp: same-box, relative,
+# containerized, main thread only. cake-dequeue is an always-polling INPUT
+# node whose clocks/packet amortizes empty polls over emitted packets, so
+# compare it only within the same load profile, never across profiles.
 
 set -euo pipefail
 
@@ -68,8 +55,7 @@ stop_vpp() {
 cli() { $B/bin/vppctl -s /run/vpp/cli.sock "$@"; }
 
 # Same must-succeed wrapper as fairness-rig.sh: vppctl exits 0 on CLI errors,
-# and a phase that silently measured a different topology than it printed is
-# exactly the failure mode this pair exists to prevent.
+# and a phase must never measure a different topology than it printed.
 cfg() {
   local out
   out=$(cli "$@" 2>&1)
@@ -80,8 +66,7 @@ cfg() {
 }
 
 # topology <port-kbps> <sub-kbps> <svlan-kbps|0>: pg0 feeds 8 subscribers on
-# pg1.100-103 and pg1.200-203. svlan-kbps=0 leaves the subscribers directly
-# under the port; otherwise 100-103 and 200-203 each become an S-VLAN tier.
+# pg1.100-103 and pg1.200-203; svlan-kbps=0 skips the S-VLAN tier.
 topology() {
   local port_kbps=$1 sub_kbps=$2 svlan_kbps=$3
 
@@ -175,18 +160,15 @@ sleep 1
 echo "== window ${MEASURE_SECONDS}s per sample, containerized main thread:"
 echo "== same-box relative numbers only (see perf/README.md boundary)."
 
-# Uncontended pair: 8 x 3000pps x 1400B = 268 Mbit offered against a 500
-# Mbit port, 50 Mbit subscribers (33.6 Mbit offered each), 250 Mbit S-VLANs.
-# Every packet is admitted on its first gate attempt in both phases, so the
-# clocks/pkt delta is the pure admission cost of the extra tier.
+# Uncontended pair: 268 Mbit offered against a 500 Mbit port, 50 Mbit
+# subscribers, 250 Mbit S-VLANs - every packet admitted on its first gate
+# attempt, so the delta is the pure admission cost of the extra tier.
 phase "port-only, uncontended"    500000 50000 0      3000
 phase "port + svlan, uncontended" 500000 50000 250000 3000
 
-# Hot pair: offered just under every rate (8 x 8000pps x 1400B = 717 Mbit
-# against an 800 Mbit port, 100 Mbit subscribers offered 89.6 Mbit each).
-# The dequeue node is busy enough for vectors/call to mean something, so
-# this is where the dequeue-side clocks/pkt delta is read; in the paced
-# pair that number is dominated by empty-poll amortization.
+# Hot pair: offered just under every rate (717 Mbit against an 800 Mbit
+# port). The dequeue node is busy enough for vectors/call to mean something,
+# so the dequeue-side delta is read here, not from the paced pair.
 phase "port-only, hot"           800000 100000 0      8000
 phase "port + svlan, hot"        800000 100000 400000 8000
 

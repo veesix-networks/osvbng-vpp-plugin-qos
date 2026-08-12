@@ -367,14 +367,17 @@ cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index, u16 svlan_id,
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
   cake_drr_shared_init (&agg->drr,
 			cake_effective_weight (rate_bytes_per_sec,
-					       agg->weight));
+					       agg->weight),
+			agg->global_shaper_time_ns);
 
   if (buffer_limit == 0)
     {
-      agg->buffer_limit =
-	(u32) ((rate_bytes_per_sec * 100000 * 3) / (1000000 * 2));
-      if (agg->buffer_limit < 1048576)
-	agg->buffer_limit = 1048576;
+      u64 derived = (rate_bytes_per_sec * 100000 * 3) / (1000000 * 2);
+      if (derived < 1048576)
+	derived = 1048576;
+      /* 0.15 s of rate passes 4 GiB at ~229 Gbit/s; saturate rather than
+       * wrap the u32 into a tiny limit. */
+      agg->buffer_limit = derived > ~0U ? ~0U : (u32) derived;
     }
   else
     agg->buffer_limit = buffer_limit;
@@ -490,6 +493,9 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
       cs->weight = weight ? weight : 1;
       cs->drr.effective_weight =
 	cake_effective_weight (rate_bytes_per_sec, cs->weight);
+      /* Seeded, not left at pool_get_zero's 0: past day 25 of uptime a zero
+       * tag sits in the future half-space where the refill test refuses it. */
+      cs->drr.round = cake_drr_round ((u64) (vlib_time_now (vm) * 1e9));
       cs->overhead_bytes = overhead_bytes;
       cs->atm_mode = atm_mode;
       cs->mpu = mpu;
@@ -701,16 +707,17 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
   cake_drr_shared_init (&agg->drr,
 			cake_effective_weight (rate_bytes_per_sec,
-					       agg->weight));
+					       agg->weight),
+			agg->global_shaper_time_ns);
 
   vec_validate_init_empty (agg->svlan_map, CAKE_SVLAN_MAX - 1, ~0);
 
   if (buffer_limit == 0)
     {
-      agg->buffer_limit =
-	(u32) ((rate_bytes_per_sec * 100000 * 3) / (1000000 * 2));
-      if (agg->buffer_limit < 1048576)
-	agg->buffer_limit = 1048576;
+      u64 derived = (rate_bytes_per_sec * 100000 * 3) / (1000000 * 2);
+      if (derived < 1048576)
+	derived = 1048576;
+      agg->buffer_limit = derived > ~0U ? ~0U : (u32) derived;
     }
   else
     agg->buffer_limit = buffer_limit;
@@ -840,6 +847,22 @@ cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
       return VNET_API_ERROR_INVALID_VALUE;
     }
 
+  /* The same invariant from the other side: a port may not be lowered
+   * beneath an S-VLAN it carries. */
+  if (rate_bytes_per_sec && agg->parent_index == ~0)
+    {
+      cake_aggregate_t *child;
+      pool_foreach (child, cm->aggregates)
+	{
+	  if (child->parent_index == agg_idx &&
+	      child->rate_bytes_per_sec > rate_bytes_per_sec)
+	    {
+	      vlib_worker_thread_barrier_release (vm);
+	      return VNET_API_ERROR_INVALID_VALUE;
+	    }
+	}
+    }
+
   old_weight = agg->drr.effective_weight;
 
   if (rate_bytes_per_sec)
@@ -925,7 +948,14 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
     return clib_error_return (0, "weight must be %u-%u", CAKE_WEIGHT_MIN,
 			      CAKE_WEIGHT_MAX);
 
-  u32 burst_ns = burst_ms * 1000000;
+  /* Widened before the multiply: a u32 product wraps at ~4295 ms, and some
+   * wrapped values land back inside the valid burst range. */
+  u64 burst_ns_wide = (u64) burst_ms * 1000000;
+  if (burst_ns_wide > CAKE_AGG_BURST_NS_MAX)
+    return clib_error_return (0, "burst must be %llu-%llu ms",
+			      CAKE_AGG_BURST_NS_MIN / 1000000,
+			      CAKE_AGG_BURST_NS_MAX / 1000000);
+  u32 burst_ns = (u32) burst_ns_wide;
   int rv;
 
   if (is_update)

@@ -220,9 +220,9 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   cs->dequeued_bytes += pkt_len;
   cake_agg_discharge (cm, cs, pkt_len);
 
-  /* The send has cleared every gate, so charge the share it consumed. An
-   * escape admission is not charged: capacity taken while the parent was
-   * idle does not count against this child's congested share. */
+  /* The send has cleared every gate, so charge the share it consumed. Escape
+   * admissions are charged like any other (F5-2); only CAKE_DRR_UNARBITRATED
+   * goes uncharged. */
   if (PREDICT_TRUE (drr == CAKE_DRR_ADMIT))
     cake_drr_local_charge (&cs->drr, adj_len);
 

@@ -30,11 +30,12 @@
 # exercises weighted DRR at both tiers at once - unequal subscribers inside
 # unequal S-VLANs under a contended port:
 #
-#   SVLANS="100-103:9000:1000,2000,4000,8000 200-203:3000:500,1000,1000,2000"
+#   SVLANS="100-103:6000:1000,2000,4000,8000 200-203:3000:500,1000,1000,2000"
 #
-# with AGG_RATE=8000 the S-VLANs ask for 12000 between them, so the port
-# divides 75/25 by their rates, and each S-VLAN then divides its own share by
-# its subscribers' rates.
+# with AGG_RATE=8000 the S-VLANs ask for 9000 between them, so the port
+# divides 2:1 by their rates, and each S-VLAN then divides its own share by
+# its subscribers' rates. No single S-VLAN may exceed the port rate; the
+# dataplane refuses it at create.
 #
 # One sub-interface is created per tag in a range, because a plain VLAN
 # sub-interface carries exactly one outer tag. In a real deployment the

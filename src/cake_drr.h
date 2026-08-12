@@ -100,6 +100,25 @@ cake_drr_round_advanced (u32 round, u32 current)
   return (i32) (round - current) > 0;
 }
 
+/* The signed test above is valid only within 2^31 rounds: a tag >24.9 days
+ * stale wraps into the future half-space and would never refill again. No
+ * real lead approaches 2^20 rounds (~17 min), so a larger one is pre-wrap
+ * staleness and is due a refill. */
+#define CAKE_DRR_ROUND_STALE_LEAD (1u << 20)
+
+static_always_inline u8
+cake_drr_round_stale (u32 round, u32 current)
+{
+  return (i32) (round - current) < -(i32) CAKE_DRR_ROUND_STALE_LEAD;
+}
+
+static_always_inline u8
+cake_drr_round_refill_due (u32 round, u32 current)
+{
+  return cake_drr_round_advanced (round, current) ||
+	 cake_drr_round_stale (round, current);
+}
+
 /* Bytes a parent passes in one round. Precomputed on configuration so the
  * refill path never divides by 1e9. */
 static_always_inline u64
@@ -184,7 +203,7 @@ cake_drr_local_admit (cake_drr_child_t *child, u64 round_bytes,
 {
   u32 round = cake_drr_round (now_ns);
 
-  if (cake_drr_round_advanced (round, child->round))
+  if (cake_drr_round_refill_due (round, child->round))
     cake_drr_refill (child, round_bytes,
 		     __atomic_load_n (active_weight, __ATOMIC_RELAXED), round);
 
@@ -291,12 +310,16 @@ cake_drr_parent_leave (u64 *active_weight, u32 *n_active_children,
 }
 
 /* A zeroed word would read as a deficit of -2^31, so a shared child is never
- * simply memset into service. */
+ * simply memset into service; the round tag is seeded so a child created past
+ * day 25 of uptime does not start in the stale half-space. */
 static_always_inline void
-cake_drr_shared_init (cake_drr_shared_child_t *child, u64 effective_weight)
+cake_drr_shared_init (cake_drr_shared_child_t *child, u64 effective_weight,
+		      u64 now_ns)
 {
   child->effective_weight = effective_weight;
-  __atomic_store_n (&child->round_deficit, CAKE_DRR_DEFICIT_BIAS,
+  __atomic_store_n (&child->round_deficit,
+		    ((u64) cake_drr_round (now_ns) << 32) |
+		      CAKE_DRR_DEFICIT_BIAS,
 		    __ATOMIC_RELEASE);
 }
 
@@ -329,7 +352,7 @@ cake_drr_shared_reserve (cake_drr_shared_child_t *child, u64 round_bytes,
       cur_round = (u32) (old >> 32);
       biased = (u32) old;
 
-      if (cake_drr_round_advanced (round, cur_round))
+      if (cake_drr_round_refill_due (round, cur_round))
 	{
 	  u64 quantum = cake_drr_quantum (
 	    round_bytes, child->effective_weight,

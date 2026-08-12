@@ -1103,8 +1103,9 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 					    parent->rate_ns_per_byte_scaled),
 			      now_ns, parent->burst_ns))
     {
-      /* Refunded iff the reserve actually happened: a work-conserving escape
-       * admits without reserving and must never be given credit back. */
+      /* Escapes charge inside the CAS (F5-2) and refund like any other
+       * admission; the test only guards a future CAKE_DRR_UNARBITRATED
+       * return, which must never be given credit back. */
       if (reserved == CAKE_DRR_ADMIT)
 	cake_drr_shared_refund (&agg->drr, adj_len);
 

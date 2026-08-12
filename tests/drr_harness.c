@@ -264,6 +264,67 @@ test_round_tag_wrap (void)
   pass ("u32 round tag wrap is benign", "~50 days of uptime");
 }
 
+/* Phase 6 CL-1: a tag >2^31 rounds stale wraps into the future half-space,
+ * where plain advancement would never refill it. The rebase must recover it
+ * without firing on the one-round lead a concurrent worker can hold. */
+static void
+test_stale_round_rebases (void)
+{
+  u64 W = 2500000, rb = 1000;
+  u64 vt = PARENT_SATURATED;
+
+  /* Local child created at round 0, consulted at uptime day ~30. */
+  {
+    cake_drr_child_t c = { .effective_weight = 625000, .deficit = 0,
+			   .round = 0 };
+    u64 day30 = 2600000000ULL * CAKE_DRR_ROUND_PERIOD_NS;
+
+    check (cake_drr_local_admit (&c, rb, &W, &vt, day30) == CAKE_DRR_ADMIT,
+	   "a stale local child refills instead of wedging", "deficit %" PRId64,
+	   c.deficit);
+    check (c.round == cake_drr_round (day30),
+	   "the rebase publishes the current round", "round %u", c.round);
+  }
+
+  /* Shared child, same staleness. */
+  {
+    cake_drr_shared_child_t c;
+    u64 day30 = 2600000000ULL * CAKE_DRR_ROUND_PERIOD_NS;
+
+    cake_drr_shared_init (&c, 625000, 0);
+    check (cake_drr_shared_reserve (&c, rb, &W, &vt, MTU_ADJ, day30) ==
+	     CAKE_DRR_ADMIT,
+	   "a stale shared child refills instead of wedging", "");
+    check ((u32) (__atomic_load_n (&c.round_deficit, __ATOMIC_RELAXED) >> 32) ==
+	     cake_drr_round (day30),
+	   "the shared rebase publishes the current round", "");
+  }
+
+  /* A one-round lead is a concurrent worker, not staleness (F5-4). */
+  {
+    cake_drr_child_t c = { .effective_weight = 625000, .deficit = 5,
+			   .round = 100 };
+    cake_drr_local_admit (&c, rb, &W, &vt, 99 * CAKE_DRR_ROUND_PERIOD_NS);
+    check (c.round == 100 && c.deficit == 5,
+	   "a one-round lead is not treated as stale",
+	   "round %u deficit %" PRId64, c.round, c.deficit);
+  }
+
+  /* A child initialized at late uptime starts current; the rebase is a
+   * recovery path, not the ordinary case. */
+  {
+    cake_drr_shared_child_t c;
+    u64 day30 = 2600000000ULL * CAKE_DRR_ROUND_PERIOD_NS;
+
+    cake_drr_shared_init (&c, 625000, day30);
+    check ((u32) (__atomic_load_n (&c.round_deficit, __ATOMIC_RELAXED) >> 32) ==
+	     cake_drr_round (day30),
+	   "shared init seeds the current round", "");
+  }
+
+  pass ("stale round tags rebase, one-round leads do not", ">2^31 rounds");
+}
+
 /* Section 9.1: rate precision at and above 1 Gbit/s, which the fixed-point
  * change (#6) introduced and which was verified by inspection only, because
  * af-packet presents one rx queue and the veth rig cannot offer multi-gigabit. */
@@ -702,7 +763,7 @@ test_shared_reserve_basics (void)
   i64 cap = cap_for (rb, 625000, W);
 
   memset (&c, 0xff, sizeof c);
-  cake_drr_shared_init (&c, 625000);
+  cake_drr_shared_init (&c, 625000, 0);
   check (shared_deficit (&c) == 0, "init leaves a zero deficit, not -2^31",
 	 "deficit %" PRId64, shared_deficit (&c));
 
@@ -747,7 +808,7 @@ test_shared_refund_pairs (void)
   u64 before, after;
   u64 now = 5 * CAKE_DRR_ROUND_PERIOD_NS;
 
-  cake_drr_shared_init (&c, 625000);
+  cake_drr_shared_init (&c, 625000, 0);
   cake_drr_shared_reserve (&c, rb, &W, &saturated, MTU_ADJ, now);
 
   before = __atomic_load_n (&c.round_deficit, __ATOMIC_RELAXED);
@@ -802,7 +863,7 @@ test_shared_reserve_linearizable (void)
   u64 total = 0, ceiling;
   i64 d;
 
-  cake_drr_shared_init (&c, 625000);
+  cake_drr_shared_init (&c, 625000, 0);
 
   for (int i = 0; i < RESERVE_THREADS; i++)
     {
@@ -850,6 +911,7 @@ main (void)
   test_oversized_head_packet ();
   test_escape_does_not_underflow_at_zero ();
   test_round_tag_wrap ();
+  test_stale_round_rebases ();
   test_rate_precision ();
   test_gate_rate_accuracy ();
   test_credit_is_proportional_to_weight ();

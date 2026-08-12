@@ -229,16 +229,19 @@ vl_api_osvbng_cake_aggregate_v2_create_t_handler (
 
   VALIDATE_SW_IF_INDEX (mp);
 
+  /* An unknown level must not fall through to the port path. */
   if (mp->level == OSVBNG_CAKE_AGG_LEVEL_SVLAN)
     rv = cake_svlan_aggregate_create (
       cm->vlib_main, ntohl (mp->sw_if_index), ntohs (mp->svlan_id),
       ntohs (mp->svlan_id_end), clib_net_to_host_u64 (mp->rate_bytes_per_sec),
       ntohl (mp->weight), ntohl (mp->burst_ns), ntohl (mp->buffer_limit));
-  else
+  else if (mp->level == OSVBNG_CAKE_AGG_LEVEL_PORT)
     rv = cake_aggregate_create (
       cm->vlib_main, ntohl (mp->sw_if_index),
       clib_net_to_host_u64 (mp->rate_bytes_per_sec), ntohl (mp->weight),
       ntohl (mp->burst_ns), ntohl (mp->buffer_limit));
+  else
+    rv = VNET_API_ERROR_INVALID_VALUE;
 
   BAD_SW_IF_INDEX_LABEL;
   REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_CREATE_REPLY);
@@ -257,8 +260,10 @@ vl_api_osvbng_cake_aggregate_v2_delete_t_handler (
   if (mp->level == OSVBNG_CAKE_AGG_LEVEL_SVLAN)
     rv = cake_svlan_aggregate_delete (cm->vlib_main, ntohl (mp->sw_if_index),
 				      ntohs (mp->svlan_id));
-  else
+  else if (mp->level == OSVBNG_CAKE_AGG_LEVEL_PORT)
     rv = cake_aggregate_delete (cm->vlib_main, ntohl (mp->sw_if_index));
+  else
+    rv = VNET_API_ERROR_INVALID_VALUE;
 
   BAD_SW_IF_INDEX_LABEL;
   REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_DELETE_REPLY);
@@ -274,11 +279,15 @@ vl_api_osvbng_cake_aggregate_v2_update_t_handler (
 
   VALIDATE_SW_IF_INDEX (mp);
 
-  rv = cake_aggregate_update (cm->vlib_main, ntohl (mp->sw_if_index),
-			      mp->level, ntohs (mp->svlan_id),
-			      clib_net_to_host_u64 (mp->rate_bytes_per_sec),
-			      ntohl (mp->weight), ntohl (mp->burst_ns),
-			      ntohl (mp->buffer_limit));
+  if (mp->level == OSVBNG_CAKE_AGG_LEVEL_PORT ||
+      mp->level == OSVBNG_CAKE_AGG_LEVEL_SVLAN)
+    rv = cake_aggregate_update (cm->vlib_main, ntohl (mp->sw_if_index),
+				mp->level, ntohs (mp->svlan_id),
+				clib_net_to_host_u64 (mp->rate_bytes_per_sec),
+				ntohl (mp->weight), ntohl (mp->burst_ns),
+				ntohl (mp->buffer_limit));
+  else
+    rv = VNET_API_ERROR_INVALID_VALUE;
 
   BAD_SW_IF_INDEX_LABEL;
   REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_UPDATE_REPLY);
