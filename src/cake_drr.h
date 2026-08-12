@@ -19,9 +19,8 @@
  * Required from the including translation unit: u8/u32/i32/u64/i64,
  * static_always_inline.
  *
- * Reference: context/specs/hqos-svlan/IMPLEMENTATION_SPEC.md sections 4.3-4.5.
- * Shreedhar & Varghese, Efficient Fair Queueing using Deficit Round Robin,
- * SIGCOMM '95.
+ * Reference: Shreedhar & Varghese, Efficient Fair Queueing using Deficit
+ * Round Robin, SIGCOMM '95.
  */
 
 #ifndef __included_cake_drr_h__
@@ -32,8 +31,8 @@
  * becomes self-sustaining: nobody sends, the clock never moves, nobody
  * unblocks. Wall time advances whether or not a packet moves.
  *
- * Compile-time by decision - a granularity knob with no good operator answer
- * (DECISIONS.md, "Configurable DRR round period"). */
+ * Compile-time by decision - a granularity knob with no good operator
+ * answer. */
 #define CAKE_DRR_ROUND_PERIOD_NS 1000000ULL
 
 /* One standard-MTU-class packet of refill headroom. Deliberately not
@@ -220,9 +219,9 @@ cake_drr_local_admit (cake_drr_child_t *child, u64 round_bytes,
    * time a full round behind the wall clock means real spare capacity.
    *
    * Charged like any other admission, and refused once the child is a packet
-   * into debt. Spec 4.4 leaves escape admissions uncharged, on the reasoning
-   * that capacity taken while the parent is idle should not count against a
-   * child's congested share. Measured, that is what breaks the S-VLAN tier:
+   * into debt. The original design left escape admissions uncharged, on the
+   * reasoning that capacity taken while the parent is idle should not count
+   * against a child's congested share. Measured, that breaks the S-VLAN tier:
    * a parent's virtual time also lags while the parent is itself blocked from
    * above, every child reads the lag as spare capacity, and because nothing is
    * charged the deficits stop moving and walk order decides everything. Two of

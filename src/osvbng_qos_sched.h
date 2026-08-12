@@ -222,10 +222,10 @@ typedef struct
    * new shared per-packet write the S-VLAN tier adds, so it takes its own line
    * rather than reintroducing the bounce 7c04b13 removed.
    *
-   * Spec 4.7 puts effective_weight with the read-mostly group and only the
-   * packed word here. Kept whole instead: the weight is read exclusively
-   * during a refill, by the same worker that is about to CAS the word beside
-   * it, so splitting them would touch two lines where one does. */
+   * Kept whole rather than splitting effective_weight into the read-mostly
+   * group: the weight is read exclusively during a refill, by the same worker
+   * that is about to CAS the word beside it, so splitting them would touch
+   * two lines where one does. */
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline3);
   cake_drr_shared_child_t drr;
 
@@ -879,9 +879,9 @@ cake_flow_discard (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
 /* Bytes a tier can actually pass in a round, which is its configured rate only
  * while nothing above it is throttling it.
  *
- * Section 4.3 derives a child's quantum from its parent's *configured* rate.
- * That is right for the port, and wrong for any tier under an oversubscribed
- * parent - the ordinary HQoS case. An S-VLAN provisioned at port rate but
+ * Deriving a child's quantum from its parent's *configured* rate is right
+ * for the port, and wrong for any tier under an oversubscribed parent - the
+ * ordinary HQoS case. An S-VLAN provisioned at port rate but
  * winning half the port hands each of its children a quantum sized for the
  * whole S-VLAN rate, so no child's deficit ever runs out, every child stays
  * permanently eligible, and the tier stops arbitrating: measured, one child of
@@ -1036,12 +1036,12 @@ cake_sched_drr_deactivate (cake_main_t *cm, cake_sched_t *cs)
   cake_agg_weight_sub (cm, cs->aggregate_index, cs->drr.effective_weight);
 }
 
-/* Steps 3 to 5 of the section 4.5 dequeue path. Ordering is deliberate: the
- * commonest rejection under saturation - the immediate parent sitting at its
- * own configured rate - fails first and unwinds nothing. A DRR block against
- * the tier above unwinds one gate charge. Only the rare port rejection unwinds
- * two things, and S-VLANs are normally provisioned under port rate so the port
- * rarely refuses what the S-VLAN accepted. */
+/* The parent chain's gates, in deliberate order: the commonest rejection
+ * under saturation - the immediate parent sitting at its own configured rate
+ * - fails first and unwinds nothing. A DRR block against the tier above
+ * unwinds one gate charge. Only the rare port rejection unwinds two things,
+ * and S-VLANs are normally provisioned under port rate so the port rarely
+ * refuses what the S-VLAN accepted. */
 typedef enum
 {
   CAKE_PARENT_OK = 0,
@@ -1064,7 +1064,7 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
   agg = pool_elt_at_index (cm->aggregates, cs->aggregate_index);
   cost_ns = cake_cost_ns (adj_len, agg->rate_ns_per_byte_scaled);
 
-  /* Step 3 */
+  /* The immediate parent's rate gate. */
   if (!cake_shaper_gate_take (&agg->global_shaper_time_ns, cost_ns, now_ns,
 			      agg->burst_ns))
     {
@@ -1081,7 +1081,7 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 
   parent = pool_elt_at_index (cm->aggregates, agg->parent_index);
 
-  /* Step 4: this aggregate's own share of the tier above, one CAS. */
+  /* This aggregate's own share of the tier above, one CAS. */
   reserved =
     cake_drr_shared_reserve (&agg->drr, parent->drr_round_bytes,
 			     &parent->active_weight,
@@ -1097,15 +1097,15 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
       return CAKE_PARENT_DRR_BLOCKED;
     }
 
-  /* Step 5 */
+  /* The tier above's rate gate. */
   if (!cake_shaper_gate_take (&parent->global_shaper_time_ns,
 			      cake_cost_ns (adj_len,
 					    parent->rate_ns_per_byte_scaled),
 			      now_ns, parent->burst_ns))
     {
-      /* Escapes charge inside the CAS (F5-2) and refund like any other
-       * admission; the test only guards a future CAKE_DRR_UNARBITRATED
-       * return, which must never be given credit back. */
+      /* Escapes charge inside the CAS and refund like any other admission;
+       * the test only guards a future CAKE_DRR_UNARBITRATED return, which
+       * must never be given credit back. */
       if (reserved == CAKE_DRR_ADMIT)
 	cake_drr_shared_refund (&agg->drr, adj_len);
 
