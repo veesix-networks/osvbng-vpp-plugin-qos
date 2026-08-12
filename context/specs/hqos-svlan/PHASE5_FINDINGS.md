@@ -199,3 +199,26 @@ What would settle it: a load source that is not the main-thread packet
 generator, and a rig that fails when its offered-load spread exceeds a
 threshold rather than reporting shares regardless. Until then this spec should
 not claim a fairness figure above roughly 20 children per tier.
+
+### Packet size
+
+VPP's packet generator cannot vary frame length within a stream when the
+stream carries an L3 `data` spec: it builds one fixed template and rejects any
+size range whose maximum exceeds it (`min-size < total header size`). Mixed
+sizes *within* a subscriber are therefore not testable on this rig at all.
+
+Mixed sizes *across* subscribers are, and they test the property that
+actually distinguishes this design: byte-based DRR must give a child sending
+small frames the same share of bytes as one sending large frames, where an
+opportunity-based round robin would hand the large-frame child several times
+its due. Measured over 30 s, 8 subscribers per S-VLAN, unequal rates at both
+tiers, contended port:
+
+| Frames offered | S-VLAN split | Worst within-tier |
+|---|---|---|
+| 1400 uniform | 66.81 / 33.19 | 0.76 pts |
+| 256 / 640 / 1400 cycled | 66.52 / 33.48 | 0.59 pts |
+
+Unchanged within noise, so the accounting is size-fair. Quantisation against
+frame size, which is the part only an intra-subscriber size mix would probe,
+remains unmeasured.

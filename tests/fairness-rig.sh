@@ -63,6 +63,16 @@ MEASURE_SECONDS=${MEASURE_SECONDS:-30}
 # several times the whole port rate per stream, so every subscriber is still
 # offered far more than its share.
 PG_RATE=${PG_RATE:-3000}
+# Frame sizes offered, as a comma list cycled across subscribers, e.g.
+# "256,640,1400". Not a range: VPP's pg builds one fixed template from the
+# data spec and rejects any size range whose maximum exceeds it
+# ("min-size < total header size"), so a single stream cannot vary its frame
+# length at all. Cycling sizes across children tests the property that
+# matters anyway - byte-based DRR must give a child sending 256-byte frames
+# the same share of bytes as one sending 1400-byte frames, where an
+# opportunity-based round robin would hand the large-frame child several times
+# its due.
+read -r -a PKT_SIZES <<< "$(echo "${PKT_SIZE:-1400}" | tr ',' ' ')"
 AGG_RATE=${AGG_RATE:-8000}
 read -r -a RATES <<< "${SUB_RATES:-5000 5000 5000 5000}"
 
@@ -168,14 +178,16 @@ else
   done
 fi
 
-echo "== topology: port ${AGG_RATE} kbps, svlans '${SVLANS:-none}', children ${RATES[*]} kbps"
+echo "== topology: port ${AGG_RATE} kbps, svlans '${SVLANS:-none}', frames ${PKT_SIZES[*]}"
 cli show cake aggregate
 
 idx=0
 for vlan in "${TAGS[@]}"; do
+  sz=${PKT_SIZES[$((idx % ${#PKT_SIZES[@]}))]}
+  # 42 = 14 ethernet + 20 IPv4 + 8 UDP
   cfg packet-generator new "name s$idx limit 0 rate $PG_RATE node ethernet-input source pg0 \
-size 1400-1400 data { IP4: 02:00:00:00:00:02 -> $MAC \
-UDP: 10.0.0.2 -> 10.$vlan.0.2 UDP: 1000 -> 2000 incrementing 1300 }"
+size $sz-$sz data { IP4: 02:00:00:00:00:02 -> $MAC \
+UDP: 10.0.0.2 -> 10.$vlan.0.2 UDP: 1000 -> 2000 incrementing $((sz - 42)) }"
   idx=$((idx + 1))
 done
 
@@ -191,6 +203,13 @@ cli show cake aggregate | grep -E 'rate|active|svlan'
 
 sleep $((MEASURE_SECONDS - MEASURE_SECONDS / 2))
 cfg packet-generator disable
+
+# A run that offered nothing must not report shares: every artifact this rig
+# has produced so far looked plausible until the offered counts were checked.
+if ! cli show cake scheduler | grep -qE 'enqueued: [1-9]'; then
+  echo "rig: no traffic reached any scheduler - check the pg stream definition" >&2
+  exit 1
+fi
 
 echo
 echo "== after ${MEASURE_SECONDS}s of offered overload"
