@@ -31,6 +31,7 @@
 /* The dependency contract both headers declare. */
 typedef uint8_t u8;
 typedef uint32_t u32;
+typedef int32_t i32;
 typedef uint64_t u64;
 typedef int64_t i64;
 #define static_always_inline static inline __attribute__ ((always_inline))
@@ -40,6 +41,12 @@ typedef int64_t i64;
 
 #define MTU_ADJ	      1514
 #define JUMBO_ATM_ADJ 9976 /* MTU 9000 under the dsl-pppoe-atm preset */
+
+/* A parent virtual time far enough ahead of any clock this harness uses that
+ * its gate never opens. Not ~0: the escape comparison is written in addition
+ * form, so a sentinel near the u64 ceiling wraps and reads as a parent that is
+ * idle. Real virtual times are clock values and cannot get near it. */
+#define PARENT_SATURATED (1000000000000000ULL)
 
 static int failures;
 static int checks;
@@ -158,7 +165,7 @@ static void
 test_oversized_head_packet (void)
 {
   cake_drr_child_t c = { .effective_weight = 625000 };
-  u64 W = 2500000, rb = 1000, saturated_vt = ~0ULL; /* escape can never fire */
+  u64 W = 2500000, rb = 1000, saturated_vt = PARENT_SATURATED;
   u64 sent = 0;
   i64 cap = cap_for (rb, c.effective_weight, W);
 
@@ -184,28 +191,39 @@ test_oversized_head_packet (void)
 }
 
 /* Section 4.4 / finding F8: written in addition form because now_ns - PERIOD
- * underflows u64 in the first round after boot and under a stub clock. */
+ * underflows u64 in the first round after boot and under a stub clock.
+ *
+ * The escape is charged like any other admission and refused past the debt
+ * floor, so it returns CAKE_DRR_ADMIT (PHASE5_FINDINGS.md F5-2). */
 static void
 test_escape_does_not_underflow_at_zero (void)
 {
   cake_drr_child_t c = { .effective_weight = 625000, .deficit = -1 };
   u64 W = 2500000, rb = 1000, vt = 0;
 
-  check (cake_drr_local_admit (&c, rb, &W, &vt, 0) != CAKE_DRR_ESCAPE,
+  check (cake_drr_local_admit (&c, rb, &W, &vt, 0) == CAKE_DRR_BLOCKED,
 	 "no spurious escape at now_ns = 0", "");
+
   c.deficit = -1;
   c.round = cake_drr_round (CAKE_DRR_ROUND_PERIOD_NS / 2);
-  check (cake_drr_local_admit (&c, rb, &W, &vt, CAKE_DRR_ROUND_PERIOD_NS / 2) !=
-	   CAKE_DRR_ESCAPE,
+  check (cake_drr_local_admit (&c, rb, &W, &vt, CAKE_DRR_ROUND_PERIOD_NS / 2) ==
+	   CAKE_DRR_BLOCKED,
 	 "no spurious escape inside the first round", "");
 
   c.deficit = -1;
   c.round = cake_drr_round (5 * CAKE_DRR_ROUND_PERIOD_NS);
-  check (cake_drr_local_admit (&c, rb, &W, &vt,
-			       5 * CAKE_DRR_ROUND_PERIOD_NS) ==
-	   CAKE_DRR_ESCAPE,
-	 "escape does fire once the parent is a round behind", "");
-  pass ("escape comparison survives a zero clock", "");
+  check (cake_drr_local_admit (&c, rb, &W, &vt, 5 * CAKE_DRR_ROUND_PERIOD_NS) ==
+	   CAKE_DRR_ADMIT,
+	 "escape fires once the parent is a round behind", "");
+
+  /* Refused past the debt floor, which is what bounds a child's state through
+   * an idle period and keeps congestion onset recoverable. */
+  c.deficit = -(i64) CAKE_MAX_PKT_BYTES - 1;
+  c.round = cake_drr_round (5 * CAKE_DRR_ROUND_PERIOD_NS);
+  check (cake_drr_local_admit (&c, rb, &W, &vt, 5 * CAKE_DRR_ROUND_PERIOD_NS) ==
+	   CAKE_DRR_BLOCKED,
+	 "escape refuses a child already a packet into debt", "");
+  pass ("escape: charged, debt-bounded, zero-clock safe", "");
 }
 
 /* Section 4.3: the u32 round tag wraps every ~50 days of uptime, costing at
@@ -215,18 +233,34 @@ test_round_tag_wrap (void)
 {
   cake_drr_child_t c = { .effective_weight = 625000, .deficit = 0 };
   u64 W = 2500000, rb = 1000;
-  u64 last = (u64) 0xffffffffULL * CAKE_DRR_ROUND_PERIOD_NS;
-  u64 vt = ~0ULL;
+  u64 vt = PARENT_SATURATED;
   i64 cap = cap_for (rb, c.effective_weight, W);
+  u64 last = (u64) 0xfffffffeULL * CAKE_DRR_ROUND_PERIOD_NS;
+
+  /* Step across the boundary the way uptime does, one round at a time. */
+  c.round = 0xfffffffdU;
 
   cake_drr_local_admit (&c, rb, &W, &vt, last);
+  check (c.round == 0xfffffffeU, "round tag advances toward u32 max",
+	 "round %u", c.round);
+
+  cake_drr_local_admit (&c, rb, &W, &vt, last + CAKE_DRR_ROUND_PERIOD_NS);
   check (c.round == 0xffffffffU, "round tag reaches u32 max", "round %u",
 	 c.round);
 
-  cake_drr_local_admit (&c, rb, &W, &vt, last + CAKE_DRR_ROUND_PERIOD_NS);
+  cake_drr_local_admit (&c, rb, &W, &vt, last + 2 * CAKE_DRR_ROUND_PERIOD_NS);
   check (c.round == 0, "round tag wraps to zero", "round %u", c.round);
-  check (c.deficit > 0 && c.deficit <= cap, "deficit stays sane across the wrap",
-	 "deficit %" PRId64, c.deficit);
+  check (c.deficit > 0 && c.deficit <= cap,
+	 "deficit stays sane across the wrap", "deficit %" PRId64, c.deficit);
+
+  /* A worker whose clock lags across the boundary must not re-refill. */
+  {
+    i64 held = c.deficit;
+    cake_drr_local_admit (&c, rb, &W, &vt, last + CAKE_DRR_ROUND_PERIOD_NS);
+    check (c.deficit == held && c.round == 0,
+	   "a lagging clock neither refills nor rewinds the round",
+	   "deficit %" PRId64 ", round %u", c.deficit, c.round);
+  }
   pass ("u32 round tag wrap is benign", "~50 days of uptime");
 }
 
@@ -650,6 +684,159 @@ test_gate_under_contention (void)
   pass ("shaper gate is linearizable", detail);
 }
 
+/* Section 4.3: a zeroed word reads as a deficit of -2^31. */
+static i64
+shared_deficit (cake_drr_shared_child_t *c)
+{
+  u64 w = __atomic_load_n (&c->round_deficit, __ATOMIC_RELAXED);
+  return (i64) (u32) w - (i64) CAKE_DRR_DEFICIT_BIAS;
+}
+
+static void
+test_shared_reserve_basics (void)
+{
+  cake_drr_shared_child_t c;
+  u64 W = 2500000, rb = 1000, saturated = PARENT_SATURATED;
+  u64 admits = 0;
+  i64 lo = 0, hi = 0;
+  i64 cap = cap_for (rb, 625000, W);
+
+  memset (&c, 0xff, sizeof c);
+  cake_drr_shared_init (&c, 625000);
+  check (shared_deficit (&c) == 0, "init leaves a zero deficit, not -2^31",
+	 "deficit %" PRId64, shared_deficit (&c));
+
+  for (u64 r = 1; r < 20000; r++)
+    {
+      u64 now = r * CAKE_DRR_ROUND_PERIOD_NS;
+      i64 d;
+
+      if (cake_drr_shared_reserve (&c, rb, &W, &saturated, MTU_ADJ, now) ==
+	  CAKE_DRR_ADMIT)
+	admits++;
+
+      d = shared_deficit (&c);
+      if (d < lo)
+	lo = d;
+      if (d > hi)
+	hi = d;
+    }
+
+  check (lo >= -(i64) MTU_ADJ, "debt stays bounded at one packet",
+	 "low water %" PRId64, lo);
+  check (hi <= cap, "credit stays bounded by the refill cap",
+	 "high water %" PRId64 ", cap %" PRId64, hi, cap);
+
+  /* 20000 rounds at 250 bytes of credit is 5 MB, or ~3300 MTU packets. */
+  check (admits > 3200 && admits < 3400, "admits at its credit rate",
+	 "admits %" PRIu64, admits);
+
+  char detail[80];
+  snprintf (detail, sizeof detail, "deficit in [%" PRId64 ", %" PRId64 "]", lo,
+	    hi);
+  pass ("shared reserve: init, debt and credit bounds", detail);
+}
+
+static void
+test_shared_refund_pairs (void)
+{
+  cake_drr_shared_child_t c;
+  /* A round's credit well above one packet, so the second reserve is a
+   * genuine admission rather than a debt-blocked one. */
+  u64 W = 2500000, rb = 100000, saturated = PARENT_SATURATED;
+  u64 before, after;
+  u64 now = 5 * CAKE_DRR_ROUND_PERIOD_NS;
+
+  cake_drr_shared_init (&c, 625000);
+  cake_drr_shared_reserve (&c, rb, &W, &saturated, MTU_ADJ, now);
+
+  before = __atomic_load_n (&c.round_deficit, __ATOMIC_RELAXED);
+  check (cake_drr_shared_reserve (&c, rb, &W, &saturated, MTU_ADJ, now) ==
+	   CAKE_DRR_ADMIT,
+	 "a second reserve inside the same round is admitted", "");
+  cake_drr_shared_refund (&c, MTU_ADJ);
+  after = __atomic_load_n (&c.round_deficit, __ATOMIC_RELAXED);
+
+  check (before == after, "refund exactly reverses its reserve",
+	 "before %llx after %llx", (unsigned long long) before,
+	 (unsigned long long) after);
+  check ((u32) (before >> 32) == (u32) (after >> 32),
+	 "refund cannot carry into the round tag", "");
+  pass ("two-level refund pairs exactly", "");
+}
+
+/* Section 9.1: shared-reserve linearizability. Every worker owning a member of
+ * the same S-VLAN CASes this one word per packet. */
+#define RESERVE_THREADS 8
+
+typedef struct
+{
+  cake_drr_shared_child_t *child;
+  u64 *W;
+  u64 *parent_vt;
+  u64 rb;
+  u64 admitted;
+} reserve_arg_t;
+
+static void *
+reserve_thread (void *raw)
+{
+  reserve_arg_t *a = raw;
+
+  for (u64 r = 1; r < 20000; r++)
+    if (cake_drr_shared_reserve (a->child, a->rb, a->W, a->parent_vt, MTU_ADJ,
+				 r * CAKE_DRR_ROUND_PERIOD_NS) ==
+	CAKE_DRR_ADMIT)
+      a->admitted++;
+
+  return NULL;
+}
+
+static void
+test_shared_reserve_linearizable (void)
+{
+  cake_drr_shared_child_t c;
+  u64 W = 2500000, rb = 1000, saturated = PARENT_SATURATED;
+  pthread_t t[RESERVE_THREADS];
+  reserve_arg_t args[RESERVE_THREADS];
+  u64 total = 0, ceiling;
+  i64 d;
+
+  cake_drr_shared_init (&c, 625000);
+
+  for (int i = 0; i < RESERVE_THREADS; i++)
+    {
+      args[i] = (reserve_arg_t){ .child = &c,
+				 .W = &W,
+				 .parent_vt = &saturated,
+				 .rb = rb,
+				 .admitted = 0 };
+      pthread_create (&t[i], NULL, reserve_thread, &args[i]);
+    }
+  for (int i = 0; i < RESERVE_THREADS; i++)
+    pthread_join (t[i], NULL);
+
+  for (int i = 0; i < RESERVE_THREADS; i++)
+    total += args[i].admitted;
+
+  d = shared_deficit (&c);
+
+  /* Threads race the same 20000 rounds, so the total admitted must still be
+   * what one round-sequence's worth of credit buys: a lost update or a double
+   * refill would show up here as extra bytes. */
+  ceiling = (20000 * 250 + (u64) cap_for (rb, 625000, W) + MTU_ADJ) / MTU_ADJ;
+  check (total <= ceiling, "no more admitted than the credit issued",
+	 "admitted %" PRIu64 ", ceiling %" PRIu64, total, ceiling);
+  check (d >= -(i64) MTU_ADJ && d <= cap_for (rb, 625000, W),
+	 "the packed word never wraps under contention", "deficit %" PRId64,
+	 d);
+
+  char detail[80];
+  snprintf (detail, sizeof detail, "%d threads, %" PRIu64 "/%" PRIu64 " admits",
+	    RESERVE_THREADS, total, ceiling);
+  pass ("shared reserve is linearizable", detail);
+}
+
 int
 main (void)
 {
@@ -670,6 +857,9 @@ main (void)
   test_weight_accounting_under_churn ();
   test_admission_race ();
   test_gate_under_contention ();
+  test_shared_reserve_basics ();
+  test_shared_refund_pairs ();
+  test_shared_reserve_linearizable ();
 
   printf ("\n%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;

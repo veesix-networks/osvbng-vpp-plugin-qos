@@ -148,6 +148,293 @@ cake_worker_has_other_schedulers (cake_main_t *cm, cake_sched_t *exclude,
   return 0;
 }
 
+/* Walk sup_sw_if_index toward the physical port, remembering the outermost
+ * single 802.1Q tag on the way. The port's S-VLAN map then decides whether the
+ * scheduler's immediate parent is an S-VLAN aggregate or the port itself.
+ *
+ * osvbng's S-VLAN sub-interfaces are single-tagged (parent.svlan via
+ * CreateSubif; the C-VLAN is never a VPP sub-interface), so this reads one_tag
+ * rather than a QinQ pair.
+ *
+ * aggregate_index is always the *immediate* parent. Everything on the hot path
+ * - the gate, the discharge chain, the DRR check - follows parent_index from
+ * there, so neither tier needs a second cached index that could go stale. */
+void
+cake_sched_resolve_attachment (cake_main_t *cm, cake_sched_t *cs)
+{
+  vnet_main_t *vnm = vnet_get_main ();
+  u32 walk = cs->sw_if_index;
+  u32 svlan_tag = ~0;
+  u32 port_index = ~0;
+  cake_aggregate_t *port;
+
+  cs->aggregate_index = ~0;
+
+  while (1)
+    {
+      vnet_sw_interface_t *wi = vnet_get_sw_interface (vnm, walk);
+      u32 parent;
+
+      if (wi->type == VNET_SW_INTERFACE_TYPE_SUB && wi->sub.eth.flags.one_tag)
+	svlan_tag = wi->sub.eth.outer_vlan_id;
+
+      parent = wi->sup_sw_if_index;
+      if (parent == walk)
+	break;
+
+      if (parent < vec_len (cm->agg_index_by_sw_if_index) &&
+	  cm->agg_index_by_sw_if_index[parent] != ~0)
+	{
+	  port_index = cm->agg_index_by_sw_if_index[parent];
+	  break;
+	}
+      walk = parent;
+    }
+
+  if (port_index == ~0)
+    return;
+
+  cs->aggregate_index = port_index;
+
+  port = pool_elt_at_index (cm->aggregates, port_index);
+  if (port->svlan_map == NULL || svlan_tag >= CAKE_SVLAN_MAX)
+    return;
+
+  if (port->svlan_map[svlan_tag] != ~0)
+    cs->aggregate_index = port->svlan_map[svlan_tag];
+}
+
+/* Three levels ship at most, but the walks below are written against the
+ * chain rather than the number. */
+#define CAKE_AGG_MAX_DEPTH 4
+
+static u32
+cake_agg_chain (cake_main_t *cm, u32 idx, u32 *chain)
+{
+  u32 n = 0;
+
+  while (idx != ~0 && n < CAKE_AGG_MAX_DEPTH)
+    {
+      chain[n++] = idx;
+      idx = pool_elt_at_index (cm->aggregates, idx)->parent_index;
+    }
+  return n;
+}
+
+static u8
+cake_agg_chain_has (u32 *chain, u32 n, u32 idx)
+{
+  for (u32 i = 0; i < n; i++)
+    if (chain[i] == idx)
+      return 1;
+  return 0;
+}
+
+/* Re-resolve every scheduler's attachment and move what the move implies.
+ * Called under the worker barrier after any change to the aggregate topology,
+ * which is the only time attachment can change.
+ *
+ * Two things travel with a member, and getting either wrong is silent:
+ *
+ * Weight, so a tier's active_weight keeps matching the sum of its active
+ * children. It leaves the old chain and joins the new one, and because the
+ * child stays active throughout, the refcount propagation handles the tiers
+ * above without special-casing.
+ *
+ * Outstanding buffer charge, because cake_agg_discharge resolves through the
+ * scheduler's *current* attachment at free time and nothing on the packet
+ * records what it was charged to. A tier the member is joining will be
+ * discharged for packets it never admitted, so it is pre-credited; a tier the
+ * member is leaving was charged for packets it will never see freed, so it is
+ * debited. Tiers common to both chains - the port, under a backfill - are
+ * charged and discharged exactly once and must not be touched. Without the
+ * pre-credit the first pre-backfill packet freed underflows a u32 and pins the
+ * tier's admission check shut for good.
+ *
+ * Exact rather than approximate: cs->buffer_usage and the aggregate charge
+ * share the raw pkt_len basis, the charge site runs only on the owner thread,
+ * handed-off packets are uncharged until re-enqueued owner-side, and the
+ * barrier means nothing is in flight. */
+static void
+cake_agg_reparent_all (cake_main_t *cm)
+{
+  cake_sched_t *cs;
+
+  pool_foreach (cs, cm->schedulers)
+    {
+      u32 old_chain[CAKE_AGG_MAX_DEPTH], new_chain[CAKE_AGG_MAX_DEPTH];
+      u32 n_old, n_new, old_parent;
+
+      old_parent = cs->aggregate_index;
+      n_old = cake_agg_chain (cm, old_parent, old_chain);
+
+      cake_sched_resolve_attachment (cm, cs);
+
+      if (cs->aggregate_index == old_parent)
+	continue;
+
+      n_new = cake_agg_chain (cm, cs->aggregate_index, new_chain);
+
+      if (cs->drr.active)
+	{
+	  cake_agg_weight_sub (cm, old_parent, cs->drr.effective_weight);
+	  cake_agg_weight_add (cm, cs->aggregate_index,
+			       cs->drr.effective_weight);
+	}
+
+      if (cs->buffer_usage == 0)
+	continue;
+
+      for (u32 i = 0; i < n_new; i++)
+	if (!cake_agg_chain_has (old_chain, n_old, new_chain[i]))
+	  pool_elt_at_index (cm->aggregates, new_chain[i])->buffer_usage +=
+	    cs->buffer_usage;
+
+      for (u32 i = 0; i < n_old; i++)
+	if (!cake_agg_chain_has (new_chain, n_new, old_chain[i]))
+	  pool_elt_at_index (cm->aggregates, old_chain[i])->buffer_usage -=
+	    cs->buffer_usage;
+    }
+}
+
+int
+cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index, u16 svlan_id,
+			     u16 svlan_id_end, u64 rate_bytes_per_sec,
+			     u32 buffer_limit)
+{
+  cake_main_t *cm = &cake_main;
+  cake_aggregate_t *port, *agg;
+  u32 port_idx, agg_idx;
+
+  if (svlan_id_end < svlan_id || svlan_id_end >= CAKE_SVLAN_MAX)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  vlib_worker_thread_barrier_sync (vm);
+
+  vec_validate_init_empty (cm->agg_index_by_sw_if_index, sw_if_index, ~0);
+  port_idx = cm->agg_index_by_sw_if_index[sw_if_index];
+  if (port_idx == ~0)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+  port = pool_elt_at_index (cm->aggregates, port_idx);
+
+  if (rate_bytes_per_sec > port->rate_bytes_per_sec)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_INVALID_VALUE;
+    }
+
+  /* S-VLAN sets are disjoint per port. */
+  for (u32 t = svlan_id; t <= svlan_id_end; t++)
+    if (port->svlan_map[t] != ~0)
+      {
+	vlib_worker_thread_barrier_release (vm);
+	return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
+      }
+
+  pool_get_aligned_zero (cm->aggregates, agg, CLIB_CACHE_LINE_BYTES);
+  agg_idx = agg - cm->aggregates;
+
+  /* pool_get may have moved the pool. */
+  port = pool_elt_at_index (cm->aggregates, port_idx);
+
+  vec_validate_aligned (agg->stats, vlib_get_n_threads () - 1,
+			CLIB_CACHE_LINE_BYTES);
+
+  agg->sw_if_index = sw_if_index;
+  agg->agg_index = agg_idx;
+  agg->level = CAKE_AGG_LEVEL_SVLAN;
+  agg->parent_index = port_idx;
+  agg->svlan_id = svlan_id;
+  agg->svlan_id_end = svlan_id_end;
+  agg->svlan_map = NULL;
+  agg->rate_bytes_per_sec = rate_bytes_per_sec;
+  agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
+  agg->drr_round_bytes = cake_drr_round_bytes (rate_bytes_per_sec);
+  agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
+  cake_drr_shared_init (&agg->drr, rate_bytes_per_sec ? rate_bytes_per_sec : 1);
+
+  if (buffer_limit == 0)
+    {
+      agg->buffer_limit =
+	(u32) ((rate_bytes_per_sec * 100000 * 3) / (1000000 * 2));
+      if (agg->buffer_limit < 1048576)
+	agg->buffer_limit = 1048576;
+    }
+  else
+    agg->buffer_limit = buffer_limit;
+
+  for (u32 t = svlan_id; t <= svlan_id_end; t++)
+    port->svlan_map[t] = agg_idx;
+
+  cake_agg_reparent_all (cm);
+
+  vlib_worker_thread_barrier_release (vm);
+
+  vlib_log_notice (cm->log_class,
+		   "svlan aggregate created on sw_if_index %u tags %u-%u "
+		   "(rate %llu B/s)",
+		   sw_if_index, svlan_id, svlan_id_end, rate_bytes_per_sec);
+
+  return 0;
+}
+
+int
+cake_svlan_aggregate_delete (vlib_main_t *vm, u32 sw_if_index, u16 svlan_id)
+{
+  cake_main_t *cm = &cake_main;
+  cake_aggregate_t *port, *agg;
+  u32 port_idx, agg_idx;
+  u16 first, last;
+
+  if (svlan_id >= CAKE_SVLAN_MAX)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  vlib_worker_thread_barrier_sync (vm);
+
+  vec_validate_init_empty (cm->agg_index_by_sw_if_index, sw_if_index, ~0);
+  port_idx = cm->agg_index_by_sw_if_index[sw_if_index];
+  if (port_idx == ~0)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+  port = pool_elt_at_index (cm->aggregates, port_idx);
+  agg_idx = port->svlan_map[svlan_id];
+  if (agg_idx == ~0)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+  agg = pool_elt_at_index (cm->aggregates, agg_idx);
+  first = agg->svlan_id;
+  last = agg->svlan_id_end;
+
+  for (u32 t = first; t <= last; t++)
+    if (port->svlan_map[t] == agg_idx)
+      port->svlan_map[t] = ~0;
+
+  /* Members fall back to the port, taking their weight and their outstanding
+   * charge with them, before the pool entry goes away. */
+  cake_agg_reparent_all (cm);
+
+  vec_free (agg->stats);
+  pool_put_index (cm->aggregates, agg_idx);
+
+  vlib_worker_thread_barrier_release (vm);
+
+  vlib_log_notice (cm->log_class,
+		   "svlan aggregate deleted on sw_if_index %u tags %u-%u",
+		   sw_if_index, first, last);
+
+  return 0;
+}
+
 int
 cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 			   u64 rate_bytes_per_sec, u8 tin_mode,
@@ -242,25 +529,7 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 	  cs->tins[t].tin_quantum = 65535 / cs->n_tins;
 	}
 
-      cs->aggregate_index = ~0;
-      {
-	u32 walk = sw_if_index;
-	while (1)
-	  {
-	    vnet_sw_interface_t *wi =
-	      vnet_get_sw_interface (vnet_get_main (), walk);
-	    u32 parent = wi->sup_sw_if_index;
-	    if (parent == walk)
-	      break;
-	    if (parent < vec_len (cm->agg_index_by_sw_if_index) &&
-		cm->agg_index_by_sw_if_index[parent] != ~0)
-	      {
-		cs->aggregate_index = cm->agg_index_by_sw_if_index[parent];
-		break;
-	      }
-	    walk = parent;
-	  }
-      }
+      cake_sched_resolve_attachment (cm, cs);
 
       cm->sched_index_by_sw_if_index[sw_if_index] = pool_index;
 
@@ -396,10 +665,15 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
 
   agg->sw_if_index = sw_if_index;
   agg->agg_index = agg_idx;
+  agg->level = CAKE_AGG_LEVEL_PORT;
+  agg->parent_index = ~0;
   agg->rate_bytes_per_sec = rate_bytes_per_sec;
   agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
   agg->drr_round_bytes = cake_drr_round_bytes (rate_bytes_per_sec);
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
+  cake_drr_shared_init (&agg->drr, rate_bytes_per_sec ? rate_bytes_per_sec : 1);
+
+  vec_validate_init_empty (agg->svlan_map, CAKE_SVLAN_MAX - 1, ~0);
 
   if (buffer_limit == 0)
     {
@@ -414,6 +688,8 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
   agg->buffer_usage = 0;
 
   cm->agg_index_by_sw_if_index[sw_if_index] = agg_idx;
+
+  cake_agg_reparent_all (cm);
 
   vlib_worker_thread_barrier_release (vm);
 
@@ -439,17 +715,28 @@ cake_aggregate_delete (vlib_main_t *vm, u32 sw_if_index)
       return VNET_API_ERROR_NO_SUCH_ENTRY;
     }
 
-  cake_sched_t *cs;
-  pool_foreach (cs, cm->schedulers)
+  cake_aggregate_t *agg = pool_elt_at_index (cm->aggregates, agg_idx);
+  cake_aggregate_t *child;
+
+  /* A port cannot be deleted out from under its S-VLANs: their parent_index
+   * would dangle and their weight contribution would never be unwound. */
+  pool_foreach (child, cm->aggregates)
     {
-      if (cs->aggregate_index == agg_idx)
-	cs->aggregate_index = ~0;
+      if (child->parent_index == agg_idx)
+	{
+	  vlib_worker_thread_barrier_release (vm);
+	  return VNET_API_ERROR_INSTANCE_IN_USE;
+	}
     }
 
-  cake_aggregate_t *agg = pool_elt_at_index (cm->aggregates, agg_idx);
-  vec_free (agg->stats);
-
   cm->agg_index_by_sw_if_index[sw_if_index] = ~0;
+
+  /* Detach before the pool entry goes away, so each member's weight leaves by
+   * the same path it arrived on. */
+  cake_agg_reparent_all (cm);
+
+  vec_free (agg->stats);
+  vec_free (agg->svlan_map);
   pool_put_index (cm->aggregates, agg_idx);
 
   vlib_worker_thread_barrier_release (vm);
@@ -466,6 +753,7 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 {
   u32 sw_if_index = ~0;
   u64 rate_kbps = 0;
+  u32 svlan_id = ~0, svlan_id_end = ~0;
   u8 is_disable = 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
@@ -473,6 +761,10 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (unformat (input, "%U", unformat_vnet_sw_interface,
 		    vnet_get_main (), &sw_if_index))
 	;
+      else if (unformat (input, "svlan %u-%u", &svlan_id, &svlan_id_end))
+	;
+      else if (unformat (input, "svlan %u", &svlan_id))
+	svlan_id_end = svlan_id;
       else if (unformat (input, "rate %llu", &rate_kbps))
 	;
       else if (unformat (input, "disable"))
@@ -486,7 +778,23 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
     return clib_error_return (0, "interface required");
 
   int rv;
-  if (is_disable)
+  if (svlan_id != ~0)
+    {
+      if (svlan_id_end < svlan_id || svlan_id_end >= CAKE_SVLAN_MAX)
+	return clib_error_return (0, "svlan range must be 0-%u ascending",
+				  CAKE_SVLAN_MAX - 1);
+      if (is_disable)
+	rv = cake_svlan_aggregate_delete (vm, sw_if_index, (u16) svlan_id);
+      else
+	{
+	  if (rate_kbps == 0)
+	    return clib_error_return (0, "rate required (kbps)");
+	  rv = cake_svlan_aggregate_create (vm, sw_if_index, (u16) svlan_id,
+					    (u16) svlan_id_end,
+					    rate_kbps * 1000 / 8, 0);
+	}
+    }
+  else if (is_disable)
     rv = cake_aggregate_delete (vm, sw_if_index);
   else
     {
@@ -503,9 +811,60 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
 VLIB_CLI_COMMAND (cake_aggregate_set_command, static) = {
   .path = "set cake aggregate",
-  .short_help = "set cake aggregate <interface> rate <kbps> [disable]",
+  .short_help = "set cake aggregate <interface> [svlan <id>[-<id>]] "
+		"rate <kbps> [disable]",
   .function = cake_aggregate_set_command_fn,
 };
+
+static void
+cake_agg_show_children (vlib_main_t *vm, cake_main_t *cm,
+			cake_aggregate_t *agg, const char *indent)
+{
+  u64 active_weight =
+    __atomic_load_n (&agg->active_weight, __ATOMIC_RELAXED);
+  u32 n_active =
+    __atomic_load_n (&agg->n_active_children, __ATOMIC_RELAXED);
+  u64 shaped_pkts, shaped_bytes, backpressure, drr_blocked, parent_blocked;
+  cake_sched_t *cs;
+
+  cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes, &backpressure,
+		      &drr_blocked, &parent_blocked);
+
+  vlib_cli_output (vm, "%sactive %u children, W %llu, round %llu bytes",
+		   indent, n_active, active_weight, agg->drr_round_bytes);
+  vlib_cli_output (vm,
+		   "%sbuffer %u/%u bytes, shaped %llu pkts %llu bytes",
+		   indent, agg->buffer_usage, agg->buffer_limit, shaped_pkts,
+		   shaped_bytes);
+  vlib_cli_output (vm,
+		   "%sbackpressure %llu, drr_blocked %llu, parent_blocked %llu",
+		   indent, backpressure, drr_blocked, parent_blocked);
+
+  /* No child list exists - arbitration is child-driven, so nothing on the hot
+   * path ever walks one. Rebuilding it is a CLI cost only. */
+  pool_foreach (cs, cm->schedulers)
+    {
+      u64 share_x10;
+
+      if (cs->aggregate_index != agg->agg_index)
+	continue;
+
+      share_x10 = (cs->drr.active && active_weight)
+		    ? (cs->drr.effective_weight * 1000) / active_weight
+		    : 0;
+
+      vlib_cli_output (
+	vm,
+	"%s  %U: weight %llu, share %llu.%llu%%, %s, quantum %llu bytes, "
+	"deficit %lld, drr_blocked %llu, parent_blocked %llu",
+	indent, format_vnet_sw_if_index_name, vnet_get_main (),
+	cs->sw_if_index, cs->drr.effective_weight, share_x10 / 10,
+	share_x10 % 10, cs->drr.active ? "active" : "idle",
+	cake_drr_quantum (agg->drr_round_bytes, cs->drr.effective_weight,
+			  active_weight),
+	cs->drr.deficit, cs->drr_blocked, cs->parent_blocked);
+    }
+}
 
 static clib_error_t *
 cake_aggregate_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
@@ -528,62 +887,41 @@ cake_aggregate_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
   cake_aggregate_t *agg;
   pool_foreach (agg, cm->aggregates)
     {
+      cake_aggregate_t *svlan;
+      u64 port_weight;
+
+      if (agg->level != CAKE_AGG_LEVEL_PORT)
+	continue;
       if (sw_if_index != ~0 && agg->sw_if_index != sw_if_index)
 	continue;
 
-      vlib_cli_output (
-	vm,
-	"  %U: rate %llu B/s (%llu kbps)",
-	format_vnet_sw_if_index_name, vnet_get_main (), agg->sw_if_index,
-	agg->rate_bytes_per_sec, agg->rate_bytes_per_sec * 8 / 1000);
+      vlib_cli_output (vm, "  %U: rate %llu B/s (%llu kbps)",
+		       format_vnet_sw_if_index_name, vnet_get_main (),
+		       agg->sw_if_index, agg->rate_bytes_per_sec,
+		       agg->rate_bytes_per_sec * 8 / 1000);
+      cake_agg_show_children (vm, cm, agg, "    ");
 
-      u64 shaped_pkts, shaped_bytes, backpressure_events;
-      cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes,
-			  &backpressure_events);
+      port_weight = __atomic_load_n (&agg->active_weight, __ATOMIC_RELAXED);
 
-      vlib_cli_output (vm,
-		       "    buffer %u/%u bytes, shaped %llu pkts %llu bytes, "
-		       "backpressure %llu",
-		       agg->buffer_usage, agg->buffer_limit, shaped_pkts,
-		       shaped_bytes, backpressure_events);
-
-      /* Workers keep moving these while the CLI reads them; the display is a
-       * snapshot, not a barrier-consistent view. */
-      u64 active_weight =
-	__atomic_load_n (&agg->active_weight, __ATOMIC_RELAXED);
-      u32 n_active =
-	__atomic_load_n (&agg->n_active_children, __ATOMIC_RELAXED);
-
-      vlib_cli_output (vm, "    active %u children, W %llu, round %llu bytes",
-		       n_active, active_weight, agg->drr_round_bytes);
-
-      /* The aggregate holds no child list - arbitration is child-driven, so
-       * nothing on the hot path ever walks one. Rebuilding it here is a CLI
-       * cost only. */
-      cake_sched_t *cs;
-      pool_foreach (cs, cm->schedulers)
+      pool_foreach (svlan, cm->aggregates)
 	{
-	  if (cs->aggregate_index != agg->agg_index)
+	  u64 share_x10;
+
+	  if (svlan->parent_index != agg->agg_index)
 	    continue;
 
-	  /* Share is what this child earns of a saturated parent right now.
-	   * An idle child is not in W and earns nothing until it activates. */
-	  u64 share_x10 =
-	    (cs->drr.active && active_weight)
-	      ? (cs->drr.effective_weight * 1000) / active_weight
+	  share_x10 =
+	    (svlan->n_active_children && port_weight)
+	      ? (svlan->drr.effective_weight * 1000) / port_weight
 	      : 0;
 
 	  vlib_cli_output (
 	    vm,
-	    "      %U: weight %llu, share %llu.%llu%%, %s, "
-	    "quantum %llu bytes, deficit %lld, "
-	    "drr_blocked %llu, parent_blocked %llu",
-	    format_vnet_sw_if_index_name, vnet_get_main (), cs->sw_if_index,
-	    cs->drr.effective_weight, share_x10 / 10, share_x10 % 10,
-	    cs->drr.active ? "active" : "idle",
-	    cake_drr_quantum (agg->drr_round_bytes, cs->drr.effective_weight,
-			      active_weight),
-	    cs->drr.deficit, cs->drr_blocked, cs->parent_blocked);
+	    "    svlan %u-%u: rate %llu B/s (%llu kbps), share %llu.%llu%%",
+	    svlan->svlan_id, svlan->svlan_id_end, svlan->rate_bytes_per_sec,
+	    svlan->rate_bytes_per_sec * 8 / 1000, share_x10 / 10,
+	    share_x10 % 10);
+	  cake_agg_show_children (vm, cm, svlan, "      ");
 	}
 
       found++;
@@ -832,7 +1170,25 @@ cake_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
 
   if (sw_if_index < vec_len (cm->agg_index_by_sw_if_index) &&
       cm->agg_index_by_sw_if_index[sw_if_index] != ~0)
-    cake_aggregate_delete (cm->vlib_main, sw_if_index);
+    {
+      u32 agg_idx = cm->agg_index_by_sw_if_index[sw_if_index];
+      cake_aggregate_t *child;
+      u16 *tags = NULL, *tag;
+
+      /* Port delete refuses while S-VLANs hang off it, so take them down
+       * first. Collect before deleting: the pool moves underneath. */
+      pool_foreach (child, cm->aggregates)
+	{
+	  if (child->parent_index == agg_idx)
+	    vec_add1 (tags, child->svlan_id);
+	}
+
+      vec_foreach (tag, tags)
+	cake_svlan_aggregate_delete (cm->vlib_main, sw_if_index, *tag);
+      vec_free (tags);
+
+      cake_aggregate_delete (cm->vlib_main, sw_if_index);
+    }
 
   return 0;
 }

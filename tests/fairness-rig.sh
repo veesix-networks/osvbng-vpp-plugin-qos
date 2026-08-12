@@ -16,8 +16,30 @@
 #     osvbng-vpp-builder:v26.06 bash /rig.sh
 #
 #   SUB_RATES="1000 2000 4000 8000"   per-subscriber kbps, one per child
-#   AGG_RATE=8000                     parent kbps
+#   AGG_RATE=8000                     port kbps
 #   MEASURE_SECONDS=30
+#
+# Two-tier mode, for the section 9.2 headline assertion - port capacity splits
+# by S-VLAN rate, and within each S-VLAN by subscriber rate:
+#
+#   SVLANS="100-103:6000 200-203:2000" tag range and kbps per S-VLAN
+#   SVLAN_SUB_RATE=5000                per-subscriber kbps, when a group does
+#                                      not name its own
+#
+# A group may carry per-subscriber rates, one per tag, for the case that
+# exercises weighted DRR at both tiers at once - unequal subscribers inside
+# unequal S-VLANs under a contended port:
+#
+#   SVLANS="100-103:9000:1000,2000,4000,8000 200-203:3000:500,1000,1000,2000"
+#
+# with AGG_RATE=8000 the S-VLANs ask for 12000 between them, so the port
+# divides 75/25 by their rates, and each S-VLAN then divides its own share by
+# its subscribers' rates.
+#
+# One sub-interface is created per tag in a range, because a plain VLAN
+# sub-interface carries exactly one outer tag. In a real deployment the
+# subscribers are session interfaces beneath one S-VLAN sub-interface, which
+# needs the session-parentage fixes this spec lists as outstanding.
 #
 # The packet generator is the load source rather than veth plus an external
 # sender: it saturates from inside the graph, so nothing upstream rate-limits
@@ -35,6 +57,12 @@ export LD_LIBRARY_PATH=$B/lib/x86_64-linux-gnu
 mkdir -p /run/vpp
 
 MEASURE_SECONDS=${MEASURE_SECONDS:-30}
+# Packets per second offered per subscriber. Explicit rather than flat out:
+# with unpaced streams the generator services them in creation order and
+# starves the tail, which reads as dataplane unfairness. At 1400 bytes this is
+# several times the whole port rate per stream, so every subscriber is still
+# offered far more than its share.
+PG_RATE=${PG_RATE:-3000}
 AGG_RATE=${AGG_RATE:-8000}
 read -r -a RATES <<< "${SUB_RATES:-5000 5000 5000 5000}"
 
@@ -54,42 +82,115 @@ $B/bin/vpp -c /tmp/fair-startup.conf &
 until $B/bin/vppctl -s /run/vpp/cli.sock show version >/dev/null 2>&1; do sleep 1; done
 cli() { $B/bin/vppctl -s /run/vpp/cli.sock "$@"; }
 
-cli create packet-generator interface pg0
-cli set interface state pg0 up
-cli set interface ip address pg0 10.0.0.1/24
+# Configuration that must succeed. vppctl exits 0 even when the CLI handler
+# returns an error, so a rejected aggregate would otherwise leave the rig
+# measuring a different topology than the one it printed - which is exactly
+# how an S-VLAN configured above its port rate once produced a page of
+# plausible, entirely meaningless numbers.
+cfg() {
+  local out
+  out=$(cli "$@" 2>&1)
+  # Not "any output": several of these print the object they created. These are
+  # the shapes a clib_error_return reaches vppctl in.
+  if printf '%s' "$out" | grep -qiE 'returned -?[0-9]+|unknown input|required|must be|invalid|no such|failed|in use'; then
+    echo "rig: configuration failed: '$*' -> $out" >&2
+    exit 1
+  fi
+}
+
+cfg create packet-generator interface pg0
+cfg set interface state pg0 up
+cfg set interface ip address pg0 10.0.0.1/24
 MAC=$(cli show hardware-interfaces pg0 | grep -oE "([0-9a-f]{2}:){5}[0-9a-f]{2}" | head -1)
 
-cli create packet-generator interface pg1
-cli set interface state pg1 up
+cfg create packet-generator interface pg1
+cfg set interface state pg1 up
 
-for i in "${!RATES[@]}"; do
-  vlan=$((100 + i))
-  cli create sub-interfaces pg1 $vlan
-  cli set interface state pg1.$vlan up
-  cli set interface ip address pg1.$vlan 10.$vlan.0.1/24
+if [ -n "${SVLANS:-}" ]; then
+  SVLAN_SUB_RATE=${SVLAN_SUB_RATE:-5000}
+  TAGS=()
+  TAG_RATES=()
+  for group in $SVLANS; do
+    range=${group%%:*}
+    rest=${group#*:}
+    kbps=${rest%%:*}
+    subs=""
+    [ "$rest" != "$kbps" ] && subs=${rest#*:}
+    first=${range%%-*}
+    last=${range##*-}
+    i=0
+    for t in $(seq "$first" "$last"); do
+      TAGS+=("$t")
+      if [ -n "$subs" ]; then
+        n_subs=$(echo "$subs" | tr ',' '\n' | wc -l)
+        TAG_RATES+=("$(echo "$subs" | cut -d, -f$(((i % n_subs) + 1)))")
+      else
+        TAG_RATES+=("$SVLAN_SUB_RATE")
+      fi
+      i=$((i + 1))
+    done
+  done
+else
+  TAGS=()
+  for i in "${!RATES[@]}"; do TAGS+=("$((100 + i))"); done
+fi
+
+idx=0
+for vlan in "${TAGS[@]}"; do
+  cfg create sub-interfaces pg1 "$vlan"
+  cfg set interface state pg1."$vlan" up
+  cfg set interface ip address pg1."$vlan" 10."$vlan".0.1/24
   # Static neighbour with a MAC nothing answers for: the rewrite succeeds and
   # the packet is shaped, without ARP resolution entering the measurement.
-  cli set ip neighbor pg1.$vlan 10.$vlan.0.2 02:00:00:00:0$i:00 static
+  cfg set ip neighbor pg1."$vlan" 10."$vlan".0.2 02:00:00:00:00:$(printf %02x $((idx + 16))) static
+  idx=$((idx + 1))
 done
 
-cli set cake aggregate pg1 rate "$AGG_RATE"
-for i in "${!RATES[@]}"; do
-  cli set cake scheduler pg1.$((100 + i)) rate "${RATES[$i]}" besteffort ethernet
-done
+cfg set cake aggregate pg1 rate "$AGG_RATE"
 
-echo "== topology: parent ${AGG_RATE} kbps, children ${RATES[*]} kbps"
+if [ -n "${SVLANS:-}" ]; then
+  for group in $SVLANS; do
+    range=${group%%:*}
+    rest=${group#*:}
+    kbps=${rest%%:*}
+    first=${range%%-*}
+    last=${range##*-}
+    cfg set cake aggregate pg1 svlan "${first}-${last}" rate "$kbps"
+  done
+  i=0
+  for vlan in "${TAGS[@]}"; do
+    cfg set cake scheduler pg1."$vlan" rate "${TAG_RATES[$i]}" besteffort ethernet
+    i=$((i + 1))
+  done
+else
+  for i in "${!RATES[@]}"; do
+    cfg set cake scheduler pg1.$((100 + i)) rate "${RATES[$i]}" besteffort ethernet
+  done
+fi
+
+echo "== topology: port ${AGG_RATE} kbps, svlans '${SVLANS:-none}', children ${RATES[*]} kbps"
 cli show cake aggregate
 
-for i in "${!RATES[@]}"; do
-  vlan=$((100 + i))
-  cli packet-generator new "name s$i limit 0 node ethernet-input source pg0 \
+idx=0
+for vlan in "${TAGS[@]}"; do
+  cfg packet-generator new "name s$idx limit 0 rate $PG_RATE node ethernet-input source pg0 \
 size 1400-1400 data { IP4: 02:00:00:00:00:02 -> $MAC \
 UDP: 10.0.0.2 -> 10.$vlan.0.2 UDP: 1000 -> 2000 incrementing 1300 }"
+  idx=$((idx + 1))
 done
 
-cli packet-generator enable
-sleep "$MEASURE_SECONDS"
-cli packet-generator disable
+cfg packet-generator enable
+
+# Sample mid-run: active_weight and n_active_children are the inputs every
+# quantum is derived from, and after the load stops they have all drained to
+# zero, which tells you nothing about what they were while it mattered.
+sleep $((MEASURE_SECONDS / 2))
+echo
+echo "== mid-run state"
+cli show cake aggregate | grep -E 'rate|active|svlan'
+
+sleep $((MEASURE_SECONDS - MEASURE_SECONDS / 2))
+cfg packet-generator disable
 
 echo
 echo "== after ${MEASURE_SECONDS}s of offered overload"
@@ -98,17 +199,74 @@ echo
 cli show errors | grep -iE 'cake' || true
 
 echo
+if [ -n "${DUMP_SCHED:-}" ]; then
+  echo
+  echo "== per-scheduler detail"
+  cli show cake scheduler
+fi
+
 echo "== shares against configured rate"
-cli show cake scheduler | awk -v rates="${RATES[*]}" '
-  BEGIN { n = split(rates, r, " "); for (i = 1; i <= n; i++) total_rate += r[i] }
+
+# Expected share of the port for each subscriber. With an S-VLAN tier that is
+# two nested splits, not one: the port divides between S-VLANs by their rate
+# (capped at each S-VLAN's own rate when the port is not oversubscribed), and
+# each S-VLAN then divides its share between its own subscribers. Comparing
+# against subscriber rate alone would read a correct 75/25 tier as a 6-point
+# error on every child.
+EXPECT=""
+if [ -n "${SVLANS:-}" ]; then
+  sum_svlan=0
+  for group in $SVLANS; do
+    rest=${group#*:}
+    sum_svlan=$((sum_svlan + ${rest%%:*}))
+  done
+  idx=0
+  for group in $SVLANS; do
+    range=${group%%:*}
+    rest=${group#*:}
+    kbps=${rest%%:*}
+    first=${range%%-*}
+    last=${range##*-}
+    n=$((last - first + 1))
+    # The port divides by S-VLAN rate, capped at what each S-VLAN asked for.
+    weighted=$((AGG_RATE * kbps / sum_svlan))
+    svlan_share=$kbps
+    [ "$weighted" -lt "$svlan_share" ] && svlan_share=$weighted
+    # The S-VLAN then divides its share by its subscribers' rates.
+    sum_sub=0
+    for j in $(seq 0 $((n - 1))); do
+      sum_sub=$((sum_sub + TAG_RATES[idx + j]))
+    done
+    for j in $(seq 0 $((n - 1))); do
+      EXPECT="$EXPECT $(awk -v s="$svlan_share" -v r="${TAG_RATES[$((idx + j))]}" \
+        -v t="$sum_sub" -v p="$AGG_RATE" 'BEGIN { printf "%.6f", 100 * (s * r / t) / p }')"
+    done
+    idx=$((idx + n))
+  done
+else
+  sum_sub=0
+  for r in "${RATES[@]}"; do sum_sub=$((sum_sub + r)); done
+  for r in "${RATES[@]}"; do
+    EXPECT="$EXPECT $(awk -v r="$r" -v t="$sum_sub" 'BEGIN { printf "%.6f", 100 * r / t }')"
+  done
+fi
+
+cli show cake scheduler | awk -v want="$EXPECT" '
+  BEGIN { split(want, w, " ") }
   /^  pg1\./  { split($1, a, ":"); name[++k] = a[1] }
   /dequeued:/ { for (i = 1; i <= NF; i++)
                   if ($i == "dequeued:") { b[k] = $(i + 3); total_bytes += $(i + 3) } }
   END {
-    for (i = 1; i <= k; i++)
+    worst = 0
+    for (i = 1; i <= k; i++) {
+      got = 100 * b[i] / total_bytes
+      err = got - w[i]
+      if (err < 0) e = -err; else e = err
+      if (e > worst) worst = e
       printf "  %-10s %14d bytes  got %6.2f%%  want %6.2f%%  err %+5.2f pts\n",
-             name[i], b[i], 100 * b[i] / total_bytes, 100 * r[i] / total_rate,
-             100 * b[i] / total_bytes - 100 * r[i] / total_rate
+             name[i], b[i], got, w[i], err
+    }
+    printf "  worst error %.2f points\n", worst
   }
 '
 echo "== done"

@@ -189,9 +189,19 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
       (*n_ecn_marks)++;
     }
 
-  if (!cake_agg_dequeue_gate (cm, cs, adj_len, now_ns, vm->thread_index))
+  /* Steps 3-5: the parent chain's rate gates and, where there is a tier above
+   * the immediate parent, that tier's own DRR reserve. */
+  cake_parent_result_t pr =
+    cake_agg_dequeue_gate (cm, cs, adj_len, now_ns, vm->thread_index);
+
+  if (PREDICT_FALSE (pr != CAKE_PARENT_OK))
     {
       flow->head--;
+      if (pr == CAKE_PARENT_DRR_BLOCKED)
+	{
+	  cs->drr_blocked++;
+	  return CAKE_DEQ_DRR_BLOCKED;
+	}
       cs->parent_blocked++;
       return CAKE_DEQ_GATE_CLOSED;
     }

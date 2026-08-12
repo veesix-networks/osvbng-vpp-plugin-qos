@@ -256,23 +256,16 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  continue;
 	}
 
-      if (cs->aggregate_index != ~0)
+      if (PREDICT_FALSE (!cake_agg_admit_chain (cm, cs, pkt_len, thread_index)))
 	{
-	  cake_aggregate_t *agg =
-	    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-	  if (PREDICT_FALSE (!cake_agg_admit (&agg->buffer_usage,
-					      agg->buffer_limit, pkt_len)))
-	    {
-	      cobalt_queue_full (flow, cs->target_us, cs->p_inc,
-				 (u32) (vlib_time_now (vm) * 1e6));
-	      vlib_buffer_free_one (vm, bi0);
-	      cs->dropped_pkts++;
-	      tin->drops++;
-	      n_dropped++;
-	      vec_elt_at_index (agg->stats, thread_index)->backpressure_events++;
-	      n_agg_backpressure++;
-	      continue;
-	    }
+	  cobalt_queue_full (flow, cs->target_us, cs->p_inc,
+			     (u32) (vlib_time_now (vm) * 1e6));
+	  vlib_buffer_free_one (vm, bi0);
+	  cs->dropped_pkts++;
+	  tin->drops++;
+	  n_dropped++;
+	  n_agg_backpressure++;
+	  continue;
 	}
 
       if (PREDICT_FALSE (flow->flow_state == CAKE_FLOW_NONE))

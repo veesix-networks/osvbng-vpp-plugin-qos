@@ -159,8 +159,12 @@ send_cake_aggregate_details (cake_aggregate_t *agg,
   rmp->rate_bytes_per_sec = clib_host_to_net_u64 (agg->rate_bytes_per_sec);
   rmp->buffer_usage = ntohl (agg->buffer_usage);
   rmp->buffer_limit = ntohl (agg->buffer_limit);
+  /* The v1 message has no field for the gate-side counters; they reach an
+   * operator through the CLI until the _v2 messages land. */
   u64 shaped_pkts, shaped_bytes, backpressure_events;
-  cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes, &backpressure_events);
+  u64 drr_blocked, parent_blocked;
+  cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes, &backpressure_events,
+		      &drr_blocked, &parent_blocked);
 
   rmp->shaped_pkts = clib_host_to_net_u64 (shaped_pkts);
   rmp->shaped_bytes = clib_host_to_net_u64 (shaped_bytes);
