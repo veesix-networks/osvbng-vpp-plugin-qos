@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a + c2e41a8, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. Carries PR #9's rotation, whose justification F5-1 later withdrew — see below. Next: §7 Phase 2, the harness |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a + c2e41a8, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. Next: §7 Phase 2, the harness |
 | Phase 6 | Code Review | Not started |
 
 ## Blocking prerequisites
@@ -61,9 +61,9 @@ compatible and #9 becomes redundant.
 > implementation predicted the unarbitrated §4.4 escape would break §9.1;
 > measurement on the built plugin refuted it. DRR alone: 0.63% spread for
 > four equal children, +0.57 points worst error at weights 1:2:4:8 — both
-> inside criteria. #9's commit is currently cherry-picked onto this branch
-> (c2e41a8) and improves those to 0.28% / +0.41 points, but is not required.
-> See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1.
+> inside criteria. #9's commit was briefly cherry-picked here and is now
+> reverted (521dbd4); it improves those to 0.28% / +0.41 points but is not
+> required. See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1.
 
 ## Build reality in this workspace
 

@@ -253,8 +253,6 @@ typedef struct
 {
   uword *active_bitmap;
   u32 random_seed;
-  /* Scheduler index the next dispatch starts its walk from. */
-  u32 walk_start;
 } cake_per_thread_t;
 
 typedef struct
