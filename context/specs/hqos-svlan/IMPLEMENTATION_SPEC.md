@@ -76,6 +76,15 @@ This spec does **not** depend on PR #9 (walk rotation). §4.4 makes walk order
 irrelevant on its own; if #9 merges, the two are compatible and #9 becomes
 redundant rather than conflicting.
 
+PR #5 (`fix/agg-buffer-accounting`) is a **hard prerequisite**, not merely
+preferred. §4.9's charge transfer and the §9.1 accounting invariants are exact
+only because #5 makes `cs->buffer_usage` track precisely what a scheduler has
+charged to its parent: it discharges the three free paths `main` leaks (the
+ring-full drop after the aggregate charge at `cake_enqueue.c:274`, flow
+eviction, and teardown drain — all routed through its `cake_flow_discard`
+helper) and converts buffer admission to fetch-add-then-verify. §4.10 and §8
+describe the post-#5/#6 code, not `main`.
+
 ## 4. Design
 
 ### 4.1 Architecture
@@ -107,9 +116,12 @@ Two properties follow:
 - **Walk order stops mattering.** Whichever scheduler `clib_bitmap_foreach`
   reaches first can only take its quantum, not all the credit. This is what
   closes issue #8 without the rotation fix.
-- **Per-child DRR state is uncontended.** A scheduler has exactly one
-  `owner_thread` and only that thread dequeues it (`cake_dequeue.c:287`), so
-  its deficit lives in `cake_sched_t` and costs no shared cache line.
+- **Scheduler-side DRR state is uncontended.** A scheduler has exactly one
+  `owner_thread` and only that thread dequeues it (`cake_dequeue.c:240`), so
+  its deficit lives in `cake_sched_t` and costs no shared cache line. The one
+  exception is the S-VLAN's own child state versus the port, which any worker
+  owning one of its members touches per packet; §4.4 makes that word
+  linearizable rather than pretending it is uncontended.
 
 ### 4.3 DRR children and weights
 
@@ -122,11 +134,25 @@ typedef struct
   u64 effective_weight;   /* own rate_bytes_per_sec x weight multiplier */
   u64 deficit;            /* bytes still sendable this round */
   u32 round;              /* round tag the deficit belongs to */
-} cake_drr_child_t;
+} cake_drr_child_t;       /* owner-thread-local: schedulers only */
+
+typedef struct
+{
+  u64 effective_weight;   /* read-mostly; lives with the identity group */
+  u64 round_deficit;      /* (round u32 << 32) | deficit bytes u32; atomic */
+} cake_drr_shared_child_t; /* multi-writer: an aggregate's own child state */
 ```
 
-Embedded once in `cake_sched_t` and once in `cake_aggregate_t`. A scheduler has
-exactly one, for its immediate parent — never one per tier.
+The plain form is embedded in `cake_sched_t` — single writer, the owner
+thread. The shared form is embedded in `cake_aggregate_t`, because an S-VLAN's
+deficit versus the port is written by whichever worker dequeues one of its
+members. Packing round and deficit into one word is what lets §4.4 refill,
+admit and decrement in a single CAS. Both halves fit u32 comfortably: the
+deficit never exceeds `cap = max(2 * quantum, CAKE_MAX_PKT_BYTES)`, and even a
+100 Gbit/s parent with 1 ms rounds caps at 25 MB against a 4.29e9 ceiling. The
+u32 round tag wraps every ~50 days of uptime, costing at worst one spurious
+refill-or-skip on an idle child — benign. A scheduler has exactly one child
+struct, for its immediate parent — never one per tier.
 
 ```
 effective_weight_i = rate_bytes_per_sec_i * weight_i        (weight_i default 1)
@@ -156,12 +182,19 @@ your rate alone earns".
 
 ### 4.4 The DRR admission rule
 
-One helper serves both tiers:
+One state layout serves both tiers; the access discipline differs by writer
+count:
 
 ```c
 static_always_inline u8
-cake_drr_admit (cake_aggregate_t *parent, cake_drr_child_t *child,
-		u32 adj_len, u64 now_ns);
+cake_drr_local_admit (cake_aggregate_t *parent, cake_drr_child_t *child,
+		      u32 adj_len, u64 now_ns);   /* read-only check */
+static_always_inline u8
+cake_drr_shared_reserve (cake_aggregate_t *parent,
+			 cake_drr_shared_child_t *child, u32 adj_len,
+			 u64 now_ns);   /* refill+admit+decrement, one CAS */
+static_always_inline void
+cake_drr_shared_refund (cake_drr_shared_child_t *child, u32 adj_len);
 ```
 
 **Rounds come from the wall clock**, not from bytes sent:
@@ -194,7 +227,12 @@ could never send a 1500-byte packet. The cap stops a child blocked on its own
 subscriber shaper from hoarding while idle-ish, and the `CAKE_MAX_PKT_BYTES`
 floor guarantees every child can eventually send one full-size packet.
 
-A child resets `deficit = 0` on activation, so going idle earns nothing.
+A scheduler's child resets `deficit = 0` on activation, so going idle earns
+nothing. The shared child does **not** reset on activation: the 0→1 transition
+happens on the enqueue hot path, where a racing reset against a concurrent
+reserve from another worker would lose a decrement. Carryover across an idle
+period is instead bounded by the refill cap — at most `cap` bytes, the same
+two-quantum burst allowance every child already has.
 
 **Work-conserving escape:**
 
@@ -207,41 +245,90 @@ Virtual time a full round behind the wall clock means real spare capacity.
 Without this an idle child's unused quantum is lost every round. Applied per
 tier independently.
 
-**Admission** is then `child->deficit >= adj_len`. Deficit, quantum and the cap
-are all **bytes**; `cost_ns` is the rate gate's unit and does not appear in the
-DRR path. The check does not mutate; see §4.5 for why.
+**Admission** is then `deficit >= adj_len`. Deficit, quantum and the cap are
+all **bytes**; `cost_ns` is the rate gate's unit and does not appear in the DRR
+path.
+
+**The two disciplines.** For a scheduler's own child the check does not mutate
+— the owner thread checks early and decrements only on final success (§4.5), so
+no refund can ever be needed. That discipline is unsound for the shared child:
+two workers passing a read-only check against the last quantum would both
+decrement later, either losing an update or wrapping the deficit below zero and
+holding the tier's admission open until the next refill.
+`cake_drr_shared_reserve` therefore linearizes the whole step in one CAS on
+`round_deficit`, the same loop shape as the shipped
+`cake_agg_dequeue_gate` (`osvbng_qos_sched.h:702`):
+
+```c
+do
+  {
+    old = __atomic_load_n (&child->round_deficit, __ATOMIC_ACQUIRE);
+    (cur_round, cur_deficit) = unpack (old);
+    if (cur_round != round)
+      cur_deficit = clib_min (cur_deficit + quantum, cap);   /* refill */
+    admitted = cur_deficit >= adj_len;
+    if (!admitted && cur_round == unpack_round (old))
+      return 0;                       /* nothing to publish: fail read-only */
+    new = pack (round, admitted ? cur_deficit - adj_len : cur_deficit);
+  }
+while (!CAS (&child->round_deficit, old, new));
+```
+
+A failed admission in an unchanged round touches nothing, so the common
+blocked path stays read-only. A refill is published even when admission fails,
+so the round advances without requiring a successful send.
+
+`cake_drr_shared_refund` is an `__atomic_fetch_add` of `adj_len` to the low
+half — it cannot carry into the round bits because deficit plus one refund is
+at most `cap + CAKE_MAX_PKT_BYTES`, far under 2^32. If a round boundary lands
+between reserve and refund, the refund credits the new round instead: bounded
+at one packet, clamped by the next refill's cap, self-correcting — the same
+accuracy class as the shaper-time refund §4.5 already accepts. Two rules keep
+refunds exact: only a reserve that actually happened may be refunded — the
+work-conserving escape admits **without** reserving, and the dequeue path
+carries a local flag so an escape admission is never refunded — and each
+reserve is refunded at most once.
 
 ### 4.5 The two-level dequeue path
 
 ```
-1. subscriber's own shaper                      (unchanged)
-2. DRR check vs S-VLAN       — read only
-3. S-VLAN rate gate CAS      — closed: refuse, nothing charged
-4. DRR check vs port         — read only (the S-VLAN's own drr_child)
-5. port rate gate CAS        — closed: refund the S-VLAN charge
-6. success: decrement both deficits
+1. subscriber's own shaper                        (unchanged)
+2. DRR check vs immediate parent — read only, owner-local
+3. S-VLAN rate gate CAS          — closed: refuse, nothing charged
+4. S-VLAN's DRR reserve vs port  — one CAS; blocked: refund the S-VLAN gate
+5. port rate gate CAS            — closed: refund the S-VLAN gate
+                                   and the step-4 reserve
+6. success: decrement the scheduler's own deficit (owner-local)
 ```
 
-Checking deficits without mutating them, and decrementing only at step 6, means
-**deficits never need refunding**. The refund problem stays confined to the one
-atomic (`svlan->global_shaper_time_ns`), unwound with a single
-`__atomic_fetch_sub` of the same `cost_ns` that was added.
+**Scheduler deficits never need refunding.** Checked at step 2, mutated only at
+step 6, by a single writer — the owner thread — so nothing can interleave.
 
-When a scheduler has no S-VLAN aggregate, steps 2 and 3 are skipped and step 4
-uses the **scheduler's own** `drr_child` against the port. There is then nothing
-to refund, and the path reduces to exactly the single-tier behaviour of Phase 1.
+The S-VLAN's shared deficit cannot use that discipline (§4.4): step 4 is a
+reserve, and it acquires a refund obligation on the two later failure paths.
+The failure ordering is deliberate. The most common rejection under saturation
+— the S-VLAN sitting at its own configured rate — fails at step 3 and unwinds
+nothing. A DRR block at step 4 refunds only the S-VLAN gate charge, a single
+`__atomic_fetch_sub` of the same `cost_ns` that was added. Only the rare port
+rejection at step 5 unwinds two things.
 
-Child-first ordering keeps refunds rare: S-VLAN aggregates are normally
-provisioned under port rate, so the port gate rarely rejects what the S-VLAN
-gate accepted. Refund safety is unchanged from `hqos-qinq`: a concurrent worker
-that observed the inflated time waits marginally longer for one packet —
-bounded, self-correcting, accuracy not correctness.
+When a scheduler has no S-VLAN aggregate, step 2 checks the scheduler's own
+`drr_child` against the port, steps 3 and 4 are skipped, and a port-gate
+failure at step 5 unwinds nothing. The path reduces to exactly the single-tier
+behaviour of Phase 1.
 
-Step 6 decrements the S-VLAN's own deficit, which is shared state written per
-packet. This is the one genuinely new shared write the design adds; §4.7 places
-it. Flat DRR straight to the port would avoid it, but would let a customer with
-100 subscribers out-compete a customer with 5, which defeats the purpose of
-having an S-VLAN tier at all.
+Child-first ordering keeps the step-5 refunds rare: S-VLAN aggregates are
+normally provisioned under port rate, so the port gate rarely rejects what the
+S-VLAN gate accepted. Refund safety is unchanged from `hqos-qinq` for the gate
+and bounded per §4.4 for the reserve: a concurrent worker that observed the
+inflated value waits marginally longer for one packet — bounded,
+self-correcting, accuracy not correctness.
+
+Step 4 writes the S-VLAN's own deficit, shared state written per packet. This
+is the one genuinely new shared write the design adds; §4.7 places it. Flat DRR
+straight to the port would avoid it, but would let a customer with 100
+subscribers out-compete a customer with 5, which defeats the purpose of having
+an S-VLAN tier at all.
 
 ### 4.6 Dequeue outcomes
 
@@ -279,13 +366,14 @@ distinguishable from an ordinary drop.
 | Field | Cache line | Purpose |
 |---|---|---|
 | `level`, `parent_index`, `svlan_id`, `weight` | cacheline0 (read-mostly) | identity and hierarchy |
+| `drr.effective_weight` | cacheline0 (read-mostly) | the aggregate's own weight as a child, read per packet, written on config only |
 | `active_weight` (`u64`), `n_active_children` (`u32`) | cacheline0 | atomics written on activation transitions only, read per packet |
-| `drr` | cacheline3 | `cake_drr_child_t` — an S-VLAN's own deficit vs the port, written per packet |
+| `drr.round_deficit` | cacheline3 | packed `(round, deficit)` word — an S-VLAN's own deficit vs the port, CAS-written per packet |
 
 The shipped layout is preserved exactly: `global_shaper_time_ns` on cacheline1,
 `buffer_usage` on cacheline2, per-thread stats out of line. Packing the new
 per-packet write next to either existing atomic would reintroduce the cache-line
-bounce that commit `7c04b13` removed, so `drr` takes its own line.
+bounce that commit `7c04b13` removed, so `round_deficit` takes its own line.
 
 Per-port S-VLAN map: 4096-entry `u32` vector hung off the port aggregate
 (~16 KB per port, O(1) lookup), `~0` for unmapped tags.
@@ -314,7 +402,7 @@ API, no per-session call.
 | Site | Transition |
 |---|---|
 | `cake_enqueue.c:347` | scheduler 0→1 active: add `effective_weight` to parent, `fetch_add` parent's `n_active_children` |
-| `cake_dequeue.c:444` | scheduler 1→0 active: reverse |
+| `cake_dequeue.c:267,393` | scheduler 1→0 active: reverse |
 | `osvbng_qos_sched.c:305` | teardown deactivation: reverse |
 
 Propagation upward is a refcount. On `fetch_add`, only the worker observing
@@ -332,7 +420,34 @@ Lifecycle operations, all under the worker barrier:
   sessions walks the scheduler pool, re-resolves attachment for schedulers whose
   encap carries that tag, and **moves their weight contribution from the port to
   the new S-VLAN**. Without the move the port double-counts them.
-- **S-VLAN delete detaches members to the port**, moving weight the other way.
+- **Backfill also transfers each moved member's outstanding buffer charge:**
+  `svlan->buffer_usage += cs->buffer_usage`. Discharge resolves through the
+  scheduler's *current* attachment at free time (`cake_agg_discharge`,
+  `osvbng_qos_sched.h:691`), and a member's queued packets were charged to the
+  port only. Without the transfer, the first pre-backfill packet freed
+  underflows the S-VLAN's `u32 buffer_usage`, which wraps and pins the
+  admission check (`cake_enqueue.c:263`) permanently shut — one backfill under
+  backlog bricks the tier. Shipped code never hits this because it never
+  reparents a scheduler that holds charged packets; backfill is what introduces
+  the hazard, and the transfer is what discharges it.
+- **S-VLAN delete detaches members to the port**, moving weight the other way
+  and reversing the charge transfer (`svlan->buffer_usage -= cs->buffer_usage`)
+  per member. Required for per-tag detach (`svlan <id> disable` on a
+  multi-range aggregate), where the aggregate survives with other members and
+  stale charges would otherwise hold backpressure on forever. On full delete
+  the counter dies with the aggregate, and the port side stays balanced without
+  adjustment: those packets charged the port at enqueue and still discharge it
+  after the detach.
+
+The transfer is exact, not approximate. `cs->buffer_usage` and the aggregate
+charge share the same basis — raw `pkt_len` (`cake_enqueue.c:274` and `:310`)
+— and the charge site runs only on the owner thread (`enqueue_local` is
+reached solely via the owner check or the one-time owner CAS,
+`cake_enqueue.c:180-193`; handed-off packets are uncharged until re-enqueued
+owner-side). Under the worker barrier no charge or discharge is in flight, so
+at transfer time `cs->buffer_usage` equals the member's outstanding parent
+charge to the byte. This equality is PR #5's invariant — the reason it is a
+hard prerequisite (§3).
 - **Port delete with children is refused.**
 - **Rate or weight update** adjusts the parent's `active_weight` by the delta if
   the child is currently active. This is why `osvbng_cake_aggregate_update`
@@ -344,19 +459,23 @@ Lifecycle operations, all under the worker barrier:
 All lifecycle mutation runs under the API/CLI worker barrier. No handler in this
 plugin may be marked mp-safe without re-review.
 
-**Invariant, asserted by the harness:** after arbitrary churn,
-`agg->active_weight == SUM effective_weight of active children` and
-`agg->n_active_children == |active children|`. Every path above can break it and
-a leak is silent — too high and every child under-sends, too low and shares
-skew.
+**Invariants, asserted by the harness:** after arbitrary churn,
+`agg->active_weight == SUM effective_weight of active children`,
+`agg->n_active_children == |active children|`, and
+`agg->buffer_usage == SUM cs->buffer_usage` over the schedulers currently
+attached beneath it (direct members for an S-VLAN; every scheduler under the
+port for a port). Every path above can break them and a leak is silent — too
+high and every child under-sends or the tier back-pressures spuriously, too low
+and shares skew or admission over-commits.
 
 ### 4.10 Enqueue admission
 
 Unchanged in shape: charge the S-VLAN's `buffer_usage`, then the port's; unwind
 the S-VLAN on port rejection. Both use the atomic fetch-add-then-verify pattern
-already shipped, so over-admission stays bounded at one packet per worker per
-level. The existing discharge helper generalises to walk the parent chain, so
-every charged-buffer free path releases at both levels.
+PR #5 establishes, so over-admission stays bounded at one packet per worker per
+level. The discharge helper generalises to walk the parent chain, so every
+charged-buffer free path — including PR #5's `cake_flow_discard` paths
+(ring-full drop, flow eviction, teardown drain) — releases at both levels.
 
 Per-level `backpressure` counters remain the buffer-side congestion signal, kept
 distinct from the gate-side `drr_blocked` and `parent_blocked`.
@@ -458,11 +577,11 @@ allowed and expected.
 
 | File | Change |
 |---|---|
-| `src/osvbng_qos_sched.h` | `cake_drr_child_t`; aggregate `level`/`parent_index`/`svlan_id`/`weight`/`active_weight`/`n_active_children`/`drr`; scheduler `drr`/`weight`/`agg_svlan_index`; `cake_drr_admit()`; `CAKE_DRR_ROUND_PERIOD_NS`, `CAKE_MAX_PKT_BYTES` |
-| `src/osvbng_qos_sched.c` | two-level create/delete/update, S-VLAN map, backfill and detach walks, attachment walk extension, weight accounting on teardown, CLI |
+| `src/osvbng_qos_sched.h` | `cake_drr_child_t`, `cake_drr_shared_child_t`; aggregate `level`/`parent_index`/`svlan_id`/`weight`/`active_weight`/`n_active_children`/`drr`; scheduler `drr`/`weight`/`agg_svlan_index`; `cake_drr_local_admit()`, `cake_drr_shared_reserve()`, `cake_drr_shared_refund()`; `CAKE_DRR_ROUND_PERIOD_NS`, `CAKE_MAX_PKT_BYTES` |
+| `src/osvbng_qos_sched.c` | two-level create/delete/update, S-VLAN map, backfill and detach walks with weight and buffer-charge transfer, attachment walk extension, weight accounting on teardown, CLI |
 | `src/osvbng_qos_sched.api` | messages in §5.2 |
 | `src/osvbng_qos_sched_api.c` | handlers for the new messages |
-| `src/cake_dequeue.c` | two-level gate with refund, `CAKE_DEQ_DRR_BLOCKED`, deficit decrement on success, weight accounting on deactivation |
+| `src/cake_dequeue.c` | two-level gate with gate and reserve refunds, escape-path no-refund flag, `CAKE_DEQ_DRR_BLOCKED`, scheduler deficit decrement on success, weight accounting on deactivation |
 | `src/cake_enqueue.c` | two-level buffer admission, weight accounting on activation |
 | `src/osvbng_qos_sched_error.def` | `DRR_BLOCKED`, `PARENT_BLOCKED`; wire the existing unincremented `AGG_SHAPED`/`AGG_BACKPRESSURE` |
 | `tests/drr_harness.c` (new) | multi-threaded harness, §9 |
@@ -483,7 +602,7 @@ allowed and expected.
 
 Each phase is independently testable and leaves the tree working.
 
-**Phase 1 — DRR on the existing port tier.** `cake_drr_child_t`, `cake_drr_admit()`,
+**Phase 1 — DRR on the existing port tier.** `cake_drr_child_t`, `cake_drr_local_admit()`,
 weight accounting at the three sites, `CAKE_DEQ_DRR_BLOCKED`, counters, CLI
 display of weight and share. Weights are **derived from configured rate only** —
 the explicit multiplier needs the `_v2` message and arrives in Phase 4. No new
@@ -535,7 +654,9 @@ inlines against a stub `vlib` clock and runs N pthreads.
 | Quantum below MTU: 1000 children, 1 Gbit/s | every child sends, none starves |
 | Progress | every active child sends within a bounded number of rounds |
 | Weight invariant after randomised churn | `active_weight == SUM active children`, `n_active_children` exact |
-| Two-level refund | every charge paired with exactly one refund; accounting balances |
+| Shared-reserve linearizability: N threads on one S-VLAN child | no deficit underflow or wrap, no double refill, bytes admitted per round ≤ quantum + cap |
+| Two-level refund | gate and reserve refunds each pair exactly once with a real charge; escape-path admissions never refunded; accounting balances |
+| Reparent under backlog: backfill and per-tag detach with queued packets | charge transfer exact, no `u32` wrap, `buffer_usage == SUM member cs->buffer_usage` afterwards |
 | Rate accuracy per tier | within ±1% |
 | Admission race under contention | no over-admission beyond one packet per worker |
 | Rate precision at ≥1 Gbit/s | within ±1% of configured |
@@ -559,8 +680,11 @@ reply) and will silently fail to build any queue.
   configured.
 - `show cake aggregate` renders the tree; `drr_blocked` and `parent_blocked`
   move independently and distinguishably.
-- Backfill: create an S-VLAN aggregate while sessions are live and passing
-  traffic; members move from the port to the S-VLAN with no accounting drift.
+- Backfill: create an S-VLAN aggregate while sessions are live **with standing
+  backlog** (offered load above subscriber rate, so queues are provably
+  nonempty); members move from the port to the S-VLAN with no accounting
+  drift. Repeat for per-tag detach. Active-but-drained traffic does not
+  exercise the charge transfer and does not count.
 - Teardown under load at both levels: quiescent `buffer_usage == 0`.
 
 ### 9.3 containerlab

@@ -15,7 +15,7 @@ pool-index order.
 |-------|-------------|--------|
 | Phase 1 | Spec Draft | **Complete** |
 | Phase 2 | Spec Refinement (Gemini) | Not started |
-| Phase 3 | Spec Critique (Codex) | Not started |
+| Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | Not started |
 | Phase 5 | Implementation | Not started |
 | Phase 6 | Code Review | Not started |
@@ -29,11 +29,14 @@ terminates at the session — no scheduler reaches an S-VLAN or a port.
 - [`osvbng-vpp-plugin-ipoe` #7](https://github.com/veesix-networks/osvbng-vpp-plugin-ipoe/pull/7)
 - [`osvbng-vpp-plugin-pppoe-control` #3](https://github.com/veesix-networks/osvbng-vpp-plugin-pppoe-control/pull/3)
 
+[#5](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/pull/5)
+(buffer accounting) is a **hard prerequisite**: the §4.9 charge transfer and
+the §9.1 accounting invariants are exact only under #5's
+`cs->buffer_usage`-equals-outstanding-charge invariant (see spec §3).
 Strongly preferred first, since the aggregate path cannot execute correctly
 without them: qos
 [#4](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/pull/4) (gate
-livelock), [#5](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/pull/5)
-(buffer accounting), [#6](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/pull/6)
+livelock), [#6](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/pull/6)
 (rate precision), [#7](https://github.com/veesix-networks/osvbng-vpp-plugin-qos/pull/7)
 (interface teardown).
 
@@ -61,9 +64,10 @@ compatible and #9 becomes redundant.
 | `src/osvbng_qos_sched.h:155` | `cake_aggregate_t` — cache-line layout to preserve |
 | `src/osvbng_qos_sched.h:175` | `cake_sched_t` — gains one `cake_drr_child_t` |
 | `src/osvbng_qos_sched.h:218` | `cake_per_thread_t` |
-| `src/cake_dequeue.c:239` | the bitmap walk whose stable order causes #8 |
-| `src/cake_dequeue.c:287` | owner-thread check — why per-child DRR state is uncontended |
-| `src/cake_dequeue.c:444` | deactivation site — weight accounting |
+| `src/cake_dequeue.c:227` | the bitmap walk whose stable order causes #8 |
+| `src/cake_dequeue.c:240` | owner-thread check — why scheduler-side DRR state is uncontended |
+| `src/cake_dequeue.c:267,393` | deactivation sites (empty detect, bitmap clear) — weight accounting |
+| `src/osvbng_qos_sched.h:691` | `cake_agg_discharge` — resolves via *current* attachment; why reparenting must transfer charges |
 | `src/cake_enqueue.c:347` | activation site — weight accounting |
 | `src/osvbng_qos_sched.c:237` | `sup_sw_if_index` attachment walk |
 | `src/osvbng_qos_sched.c:305` | teardown deactivation — weight accounting |
@@ -74,22 +78,31 @@ compatible and #9 becomes redundant.
 Read context/PROCESS.md, then context/specs/hqos-svlan/README.md,
 IMPLEMENTATION_SPEC.md and DECISIONS.md.
 
-We are at Phase 1 complete. The spec adds an S-VLAN aggregate tier and weighted
-DRR across the children of any aggregate, reversing the "Weighted DRR in Phase 1"
-rejection recorded in ../hqos-qinq/DECISIONS.md on the strength of measured
-starvation (issue #8).
+We are at Phase 3 complete (Codex adversarial critique, 2026-08-12). Two
+verified findings were folded in: the S-VLAN's shared deficit is now a packed
+(round, deficit) word reserved in one CAS with a bounded refund (§4.3-§4.5,
+§4.7), and backfill/detach transfer each moved member's outstanding buffer
+charge under the barrier (§4.9), with PR #5 promoted to hard prerequisite
+(§3). DECISIONS.md "Phase 3" records acceptances, scope corrections, and
+rejected alternatives.
 
-Next step is Phase 2 or 3 review. The three things most worth attacking:
+Next step is Phase 2 (Gemini) if run at all, else Phase 4 finalization. The
+things now most worth attacking:
 
 1. The progress argument in section 4.4. Wall-clock rounds exist to prevent a
    deadlock where every child is blocked, nothing sends, and nothing unblocks.
-   Is that argument complete, and does the work-conserving escape interact with
-   it safely?
-2. The weight accounting in section 4.9. active_weight and n_active_children are
-   maintained at three sites with refcount propagation upward. A leak in either
-   direction is silent. Are the transition points exhaustive, and is the
-   backfill-on-create weight move correct under concurrent activation?
-3. The cache-line placement in section 4.7. An S-VLAN's own deficit is a new
-   shared per-packet write. Does cacheline3 hold, and is the read-mostly group
-   still read-mostly?
+   Is that argument complete, and does the work-conserving escape interact
+   safely with the reserve CAS — in particular, can an escape admission ever
+   be refunded?
+2. The refund pairing in sections 4.4-4.5. A reserve may be refunded at most
+   once, only if it happened, and a refund may cross a round boundary. Is the
+   bounded-inaccuracy argument airtight under all three failure orderings?
+3. The charge transfer in section 4.9. It relies on cs->buffer_usage equalling
+   the member's outstanding parent charge at barrier time, which in turn
+   relies on PR #5 and on handed-off packets being uncharged. Does any path
+   violate that equality?
+4. The weight accounting in section 4.9. active_weight and n_active_children
+   are maintained at three sites with refcount propagation upward. Are the
+   transition points exhaustive, and is the backfill-on-create weight move
+   correct under concurrent activation?
 ```

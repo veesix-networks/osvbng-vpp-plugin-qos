@@ -1,8 +1,10 @@
 # Decisions: hqos-svlan
 
-Phases 2 and 3 (Gemini refinement, Codex critique) have not run. The entries
-below are decisions taken during Phase 1 drafting, recorded here so the review
-agents attack the reasoning rather than rediscover it.
+Phase 2 (Gemini refinement) has not run. Phase 3 (Codex adversarial critique)
+ran 2026-08-12; its findings were verified against source before acceptance and
+are recorded under "Phase 3". Phase 1 entries are decisions taken during
+drafting, recorded here so the review agents attack the reasoning rather than
+rediscover it.
 
 ## Accepted
 
@@ -50,6 +52,9 @@ agents attack the reasoning rather than rediscover it.
 - **Resolution:** Ordering the two-level path so deficits mutate only after both
   gates accept means deficits never need refunding, and the refund path stays
   confined to the single atomic `hqos-qinq` already had to unwind. §4.5.
+- **Superseded in part by Phase 3:** holds for scheduler-side deficits only
+  (single writer). The S-VLAN's shared deficit is a CAS reserve with a bounded
+  refund — see "Shared S-VLAN deficit must be linearizable" below.
 
 ### Work-conserving escape when a parent is not saturated
 - **Source:** Phase 1
@@ -83,6 +88,72 @@ agents attack the reasoning rather than rediscover it.
   balance, progress — are what make the two-level path reviewable, and it also
   covers the already-merged admission race and fixed-point rate change, neither
   of which any test has ever exercised. §9.1.
+
+## Phase 3 — Codex adversarial critique (2026-08-12)
+
+Two findings raised, both verified against source before acceptance; each was
+narrower or differently weighted than reported, and the corrections are
+recorded alongside the acceptances.
+
+### Accepted: shared S-VLAN deficit must be linearizable
+- **Source:** Phase 3 (Codex), verified
+- **Severity:** CRITICAL
+- **Resolution:** The draft specified a read-only DRR check at one step and a
+  decrement at a later step for the S-VLAN's own child versus the port — state
+  written per packet by every worker owning one of its members. Check-then-
+  decrement is not coherent there: lost updates with plain stores, TOCTOU
+  underflow wrapping a `u64` deficit open until the next refill with atomics,
+  and double refill when two workers race the round transition. Fixed by
+  packing `(round u32, deficit u32)` into one word and making refill + admit +
+  decrement a single CAS mirroring the shipped `cake_agg_dequeue_gate`
+  (`osvbng_qos_sched.h:702`), with a bounded `fetch_add` refund on later gate
+  rejection. §4.3–§4.5, §4.7.
+- **Scope correction to the finding:** Codex's "invalidates the claimed
+  weighted fairness" is overbroad. Every Phase 1 DRR child is a scheduler,
+  whose state is owner-thread-local end to end (`cake_dequeue.c:240`,
+  charge site owner-only at `cake_enqueue.c:180-193`); Phase 1 is unaffected.
+  Only the Phase 3 S-VLAN→port arbitration carried the race. The contended
+  per-packet write Codex flagged is real but of the same cardinality as the
+  S-VLAN gate CAS every packet already pays.
+
+### Accepted: reparenting under backlog must transfer charge lineage
+- **Source:** Phase 3 (Codex), verified
+- **Severity:** HIGH (CRITICAL consequence on the backfill path)
+- **Resolution:** `cake_agg_discharge` resolves through the scheduler's
+  *current* attachment at free time (`osvbng_qos_sched.h:691`); nothing on the
+  packet records what was charged. Shipped code is safe only because it never
+  reparents a scheduler holding charged packets — create does not backfill,
+  delete detaches only while destroying the charge target
+  (`osvbng_qos_sched.c:358-447`). The spec's backfill breaks that invariant: a
+  pre-backfill packet freed post-backfill underflows the S-VLAN's `u32`
+  `buffer_usage`, wraps it, and pins admission (`cake_enqueue.c:263`) shut.
+  Fixed by barrier-time charge transfer: `cs->buffer_usage` moves between
+  parents with the member. Exact because both counters share the raw `pkt_len`
+  basis (`cake_enqueue.c:274`, `:310`), the charge site is owner-thread-only,
+  handed-off packets are uncharged, and the barrier quiesces the rest. Depends
+  on PR #5 (`fix/agg-buffer-accounting`), promoted to hard prerequisite. §3,
+  §4.9, §9.1, §9.2.
+- **Scope correction to the finding:** full S-VLAN delete is benign — the
+  counter dies with the aggregate and the port stays balanced, exactly as
+  shipped delete behaves today. The undischargeable-charge hazard is real for
+  backfill and for per-tag detach where the aggregate survives.
+
+### Rejected: drain-before-reparent (Codex's primary recommendation)
+- **Source:** Phase 3 (Codex)
+- **Severity:** MEDIUM
+- **Rationale:** Refusing attachment changes while backlog is nonzero stalls
+  indefinitely on busy residential sessions unless enqueue is gated during the
+  drain, which adds a hot-path state check to fix a config-time problem. The
+  barrier transfer achieves exactness with zero hot-path cost.
+
+### Rejected: per-packet charge lineage / per-worker credit redesign
+- **Source:** Phase 3 (Codex alternatives)
+- **Severity:** MEDIUM
+- **Rationale:** Recording charged aggregate indices in buffer metadata costs
+  opaque space and forces aggregates to outlive their deletion until every
+  charge drains. Per-worker credits with reconciliation changes the fairness
+  semantics to fix a race the packed CAS removes outright, using a loop shape
+  the codebase already ships.
 
 ## Rejected
 
