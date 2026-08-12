@@ -105,7 +105,7 @@ rediscover it.
 
 ## Phase 6 — post-implementation code review triage (2026-08-12)
 
-Three passes over `ae8ed7c..HEAD` and the osvbng control-plane branch:
+Three passes over `c90ebf6..HEAD` and the osvbng control-plane branch:
 Claude bug hunt (`code-reviews/CLAUDE.md`), Codex spec compliance
 (`code-reviews/CODEX.md`), Codex protocol conformance
 (`code-reviews/CODEX-PROTOCOL.md`, the Gemini slot, run on Codex at the
@@ -209,7 +209,7 @@ level/rate validation pair, which is the strongest signal in the set.
 - **Rationale:** The arithmetic is correct as reported — `cake_cost_ns`
   floors each packet's cost and the error is systematic, 2.4% over rate at
   100 Gbit/s / 64 B. But it is v1-shipped arithmetic
-  (`ae8ed7c:osvbng_qos_sched.h:709-723`), extracted unchanged into
+  (`c90ebf6:osvbng_qos_sched.h:709-723`), extracted unchanged into
   `cake_shaper.h`; this branch neither introduced it nor widened its blast
   radius, and the fix (per-thread fractional remainder, or folding fraction
   into the gate word) is its own design with its own verification burden.

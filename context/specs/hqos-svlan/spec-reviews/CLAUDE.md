@@ -1,7 +1,7 @@
 # Phase 2 Review: hqos-svlan (Claude Fable 5, substituting for Gemini)
 
 **Date:** 2026-08-12
-**Input:** `IMPLEMENTATION_SPEC.md` @ `b27ed3f`, `DECISIONS.md`, plugin source on
+**Input:** `IMPLEMENTATION_SPEC.md` @ `b381405`, `DECISIONS.md`, plugin source on
 `spec/hqos-svlan` (= `main`), fix branches `fix/agg-buffer-accounting` (#5),
 `fix/agg-gate-livelock` (#4), `fix/shaper-rate-precision` (#6),
 `fix/sched-interface-teardown` (#7), `fix/agg-walk-rotation` (#9), and the

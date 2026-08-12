@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **All five §7 phases done.** DRR, harness, the S-VLAN tier, the `_v2` API (v1 CRCs verified unchanged), and the osvbng control plane on `feat/hqos-svlan-control-plane` in that repo. Open items in [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (03246c1, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **All five §7 phases done.** DRR, harness, the S-VLAN tier, the `_v2` API (v1 CRCs verified unchanged), and the osvbng control plane on `feat/hqos-svlan-control-plane` in that repo. Open items in [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) |
 | Phase 6 | Code Review | **Complete** (2026-08-12) — Claude bug hunt + two Codex adversarial passes (spec compliance; protocol conformance in the Gemini slot, at user direction), artifacts in [code-reviews/](code-reviews/). §9.3 benchmark gate **passed** ([PHASE6_VERIFICATION.md](PHASE6_VERIFICATION.md), `tests/perf-rig.sh`): tier costs +1.0 clk/pkt enqueue / +5.3% dequeue at the hot point. Triage in DECISIONS.md "Phase 6": 7 findings accepted and fixed (incl. the CRITICAL stale-round-tag wedge both reviewers found independently), 1 recorded, 1 rejected as pre-existing v1 arithmetic. Harness 71 checks green; two-tier fairness re-verified post-fix (worst 0.30 pts) |
 
 ## Blocking prerequisites
@@ -62,7 +62,7 @@ compatible and #9 becomes redundant.
 > measurement on the built plugin refuted it. DRR alone: 0.63% spread for
 > four equal children, +0.57 points worst error at weights 1:2:4:8 — both
 > inside criteria. #9's commit was briefly cherry-picked here and is now
-> reverted (521dbd4); it improves those to 0.28% / +0.41 points but is not
+> reverted (06ddffd); it improves those to 0.28% / +0.41 points but is not
 > required. See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1.
 
 ## Build reality in this workspace
@@ -108,7 +108,7 @@ rig, not the harness.
 
 ## Codebase Entry Points
 
-Line numbers are on `feat/hqos-svlan-drr` as of ba1e335 (§7 Phases 1-2 done).
+Line numbers are on `feat/hqos-svlan-drr` as of 01ca239 (§7 Phases 1-2 done).
 
 | Path | Relevance |
 |---|---|

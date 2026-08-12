@@ -3,7 +3,7 @@
 - **Reviewer:** Claude (Opus 5), line-level pass
 - **Lens:** races, memory safety, buffer/credit leaks, refund obligations,
   arithmetic edges, control-plane state handling
-- **Target:** plugin `ae8ed7c..HEAD` and osvbng `main..feat/hqos-svlan-control-plane`
+- **Target:** plugin `c90ebf6..HEAD` and osvbng `main..feat/hqos-svlan-control-plane`
 - **Date:** 2026-08-12
 
 Ordered most severe first. Where a finding overlaps a Codex finding it says
@@ -129,7 +129,7 @@ handlers.
 CODEX-PROTOCOL #2 is arithmetically right: `cake_cost_ns` floors to whole
 ns per packet, and at 100 Gbit/s with 64-byte frames that admits 2.4% over
 rate (5 ns charged vs 5.12 true). Scope correction from the git history:
-the identical arithmetic shipped in v1 (`ae8ed7c:src/osvbng_qos_sched.h:709-723`)
+the identical arithmetic shipped in v1 (`c90ebf6:src/osvbng_qos_sched.h:709-723`)
 for both the subscriber shaper and the port aggregate — this branch
 extracted it into `cake_shaper.h` unchanged. The S-VLAN tier applies it at
 no higher a rate than the v1 port aggregate already did. At BNG subscriber

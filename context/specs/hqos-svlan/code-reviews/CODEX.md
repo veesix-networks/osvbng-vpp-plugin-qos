@@ -4,7 +4,7 @@
 - **Lens:** did the implementation build what `IMPLEMENTATION_SPEC.md` (as
   amended by PHASE5_FINDINGS.md F5-2/F5-3/F5-4) specifies; VPP binary API
   correctness
-- **Target:** branch diff `ae8ed7c..HEAD`
+- **Target:** branch diff `c90ebf6..HEAD`
 - **Date:** 2026-08-12
 - **Verdict as returned:** needs-attention
 

@@ -70,7 +70,7 @@ decides who gets it; it was wrong about how much capacity that is worth.
 ### Consequences
 
 - `DECISIONS.md` keeps its original rejection of #9; the reversal is undone.
-- The cherry-picked rotation commit is reverted (521dbd4). It is harmless and
+- The cherry-picked rotation commit is reverted (06ddffd). It is harmless and
   marginally beneficial (0.63% → 0.28% spread, +0.57 → +0.41 points weighted),
   but the one-feature-per-PR exception taken to land it was bought with
   evidence that did not hold. #9 stands or falls on its own merits; the

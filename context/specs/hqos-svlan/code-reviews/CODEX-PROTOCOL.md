@@ -6,7 +6,7 @@
   arithmetic, round-tag wraparound, effective-quantum derivation, the charged
   work-conserving escape, hierarchical composition, shaper fixed-point
   arithmetic, atomic orderings
-- **Target:** branch diff `ae8ed7c..HEAD`
+- **Target:** branch diff `c90ebf6..HEAD`
 - **Date:** 2026-08-12
 - **Verdict as returned:** needs-attention
 
