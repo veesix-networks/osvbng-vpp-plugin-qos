@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done** (81be05a + c2e41a8, 2026-08-12) — DRR on the existing port tier, plus PR #9's walk rotation, which F5-1 showed is required rather than redundant. Not compiled: no VPP tree in this workspace. Next: §7 Phase 2, the harness |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a + c2e41a8, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. Carries PR #9's rotation, whose justification F5-1 later withdrew — see below. Next: §7 Phase 2, the harness |
 | Phase 6 | Code Review | Not started |
 
 ## Blocking prerequisites
@@ -57,24 +57,39 @@ This spec does **not** depend on
 rotation). DRR makes walk order irrelevant on its own; if #9 merges the two are
 compatible and #9 becomes redundant.
 
-> **Reversed at Phase 5 (2026-08-12).** Measured: DRR makes walk order
-> irrelevant on the *arbitrated* path only. The §4.4 work-conserving escape
-> is unarbitrated by design and carries ~14% of the parent's capacity under
-> saturation, all of it to the lowest pool index — 36.8% vs 21.0% for four
-> equal children, against a §9.1 criterion of ±2%. #9 is complementary, not
-> redundant, and its commit is now cherry-picked onto this branch (c2e41a8).
-> See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1 and DECISIONS.md.
+> **Challenged and upheld at Phase 5 (2026-08-12).** A model built during
+> implementation predicted the unarbitrated §4.4 escape would break §9.1;
+> measurement on the built plugin refuted it. DRR alone: 0.63% spread for
+> four equal children, +0.57 points worst error at weights 1:2:4:8 — both
+> inside criteria. #9's commit is currently cherry-picked onto this branch
+> (c2e41a8) and improves those to 0.28% / +0.41 points, but is not required.
+> See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1.
 
 ## Build reality in this workspace
 
-The workspace has no VPP tree, so plugin C **cannot be compiled or run
-locally** — it builds only inside VPP via `-DVPP_EXTRA_PLUGINS` or a symlink
-into `vpp/src/plugins/`. Consequence for Phase 5 sequencing: keep the DRR
-core (`cake_drr_*` inlines, quantum arithmetic, the packed-word reserve) free
-of `vlib`/`vnet` dependencies beyond fixed-width types, so
-`tests/drr_harness.c` compiles and runs standalone against a stub clock on a
-plain host toolchain. That is the only local verification available; the
-containerlab suites and the benchmark need a VPP environment.
+**Superseded 2026-08-12 — the plugin builds and runs here.** Two siblings
+make it possible, and Phase 1 was verified with both:
+
+- `../vpp` — VPP v26.06 source, the pinned `DATAPLANE_VERSION`.
+- `../osvbng-vpp` — containerised builder. Copy the plugin sources into
+  `plugins/osvbng_qos_sched/`, then
+  `DOCKER_DEFAULT_PLATFORM=linux/amd64 VPP_DEV_TARGET=osvbng_qos_sched_plugin make vpp-dev`.
+  Incremental, about a minute, and it builds the `MULTIARCH_SOURCES` SIMD
+  variants too. amd64 under Rosetta on an arm64 host.
+
+VPP itself can then be run in that container against the built `.so`, which
+is how the §9.2 fairness rig ran (packet generator into sub-interfaces under
+one port aggregate, `show cake scheduler` for per-subscriber bytes). That is
+a real measurement of the real code, not a model.
+
+Keeping the DRR core (`cake_drr_*` inlines, quantum arithmetic, and later the
+packed-word reserve) free of `vlib`/`vnet` dependencies beyond fixed-width
+types is still worth doing — `tests/drr_harness.c` gets to link the shipped
+arithmetic and run it under pthreads without a VPP environment. But it is no
+longer the *only* verification available, and F5-1 is a worked example of a
+standalone model confidently predicting behaviour the real dataplane does not
+show. Anything involving dispatch timing or share measurement belongs in the
+rig, not the harness.
 
 ## Key Context Files
 

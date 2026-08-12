@@ -313,16 +313,10 @@ VLIB_NODE_FN (cake_dequeue_node)
    * dispatch made a shared aggregate gate a strict priority: the first
    * scheduler polled took the credit and the rest found it shut.
    *
-   * DRR does not subsume this, which is the one place the spec was wrong.
-   * It bounds each child's share of the *arbitrated* capacity, but the
-   * work-conserving escape admits without consulting a deficit, and under
-   * saturation that unarbitrated remainder is a large fraction of the
-   * parent's rate - the children refill on a common round boundary, so they
-   * go eligible and go spent together, and the escape covers the gaps.
-   * Whoever the walk reaches first collected every one of them: 36.8% against
-   * 21.0% for four equal-weight children. The two mechanisms are
-   * complementary - DRR weights the arbitrated share, rotation spreads the
-   * remainder. See context/specs/hqos-svlan/PHASE5_FINDINGS.md. */
+   * DRR already removes that on its own - a child can only take its quantum,
+   * whichever order it is reached in. Measured over 30 s, four equal children
+   * under an 8 Mbit/s aggregate: 0.63% spread with DRR alone, 0.28% with the
+   * rotation as well. The rotation is a refinement here, not the fix. */
   uword si;
   cake_walk_t walk;
 
