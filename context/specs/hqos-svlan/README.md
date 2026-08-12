@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 committed** (81be05a, 2026-08-12) — DRR on the existing port tier. Not compiled: no VPP tree in this workspace. One open finding blocks the phase's own acceptance criterion — see [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) |
+| Phase 5 | Implementation | **§7 Phase 1 done** (81be05a + c2e41a8, 2026-08-12) — DRR on the existing port tier, plus PR #9's walk rotation, which F5-1 showed is required rather than redundant. Not compiled: no VPP tree in this workspace. Next: §7 Phase 2, the harness |
 | Phase 6 | Code Review | Not started |
 
 ## Blocking prerequisites
@@ -57,13 +57,13 @@ This spec does **not** depend on
 rotation). DRR makes walk order irrelevant on its own; if #9 merges the two are
 compatible and #9 becomes redundant.
 
-> **Contradicted at Phase 5 (2026-08-12).** Measured: DRR makes walk order
+> **Reversed at Phase 5 (2026-08-12).** Measured: DRR makes walk order
 > irrelevant on the *arbitrated* path only. The §4.4 work-conserving escape
 > is unarbitrated by design and carries ~14% of the parent's capacity under
 > saturation, all of it to the lowest pool index — 36.8% vs 21.0% for four
 > equal children, against a §9.1 criterion of ±2%. #9 is complementary, not
-> redundant. See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1; awaiting a
-> human call.
+> redundant, and its commit is now cherry-picked onto this branch (c2e41a8).
+> See [PHASE5_FINDINGS.md](PHASE5_FINDINGS.md) F5-1 and DECISIONS.md.
 
 ## Build reality in this workspace
 

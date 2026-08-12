@@ -273,14 +273,34 @@ item 2, arithmetic bound corrected by F7).
 
 ## Rejected
 
-### Depend on the walk-rotation fix (PR #9) for fairness
+### ~~Depend on the walk-rotation fix (PR #9) for fairness~~ — REVERSED at Phase 5
 - **Source:** Phase 1
 - **Severity:** MEDIUM
-- **Rationale:** Rotation equalises service opportunities per dispatch, not
-  bytes, so it lands on equal shares only when children have equal rates and
-  equal demand. It carries no weighting and no notion of a child's rate. DRR
-  makes walk order irrelevant on its own (§4.2), so this spec neither requires
-  nor conflicts with #9.
+- **Original rationale:** Rotation equalises service opportunities per
+  dispatch, not bytes, so it lands on equal shares only when children have
+  equal rates and equal demand. It carries no weighting and no notion of a
+  child's rate. DRR makes walk order irrelevant on its own (§4.2), so this
+  spec neither requires nor conflicts with #9.
+- **Reversed 2026-08-12 (human decision), see PHASE5_FINDINGS.md F5-1:** the
+  original rationale is right about what rotation *is* and wrong about DRR
+  subsuming it. DRR makes walk order irrelevant on the arbitrated path only.
+  The §4.4 work-conserving escape admits without consulting or decrementing a
+  deficit, and it is not a corner case: children refill on a common round
+  boundary, so they go eligible and go spent together, leaving gaps the escape
+  fills. Under saturation with MTU-sized packets that unarbitrated remainder
+  is ~14% of the parent's rate, and walk order gave all of it to the lowest
+  pool index — 36.8 / 21.2 / 21.0 / 21.0 % for four equal children against
+  §9.1's ±2%. Removing the escape instead costs 14% utilisation (four busy
+  children) to 55% (two busy, two trickling), so it has to stay. The two are
+  complementary: DRR weights the arbitrated share, rotation spreads the
+  remainder. Together they measure 25.1 / 24.8 / 25.4 / 24.7 % at full
+  utilisation. #9's commit is cherry-picked onto `feat/hqos-svlan-drr`
+  (c2e41a8) rather than merged separately, accepting the one-feature-per-PR
+  exception.
+- **Still open:** with weights 1:2:4:8 rotation does not help (4.6 → 5.1
+  points of error) because escape admissions are equal-opportunity and so
+  over-serve low-weight children. Outside a strict reading of §9.1's ±5%
+  weighted row. Deferred to the Phase 2 harness to characterise properly.
 
 ### Aggregate-driven dequeue (invert the loop, DRR from a central arbiter)
 - **Source:** Phase 1

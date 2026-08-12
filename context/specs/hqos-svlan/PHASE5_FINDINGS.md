@@ -9,7 +9,11 @@ human already ruled on in `DECISIONS.md`.
 
 - **Raised:** 2026-08-12, during section 7 Phase 1 implementation
 - **Severity:** HIGH — the phase's stated acceptance criterion is not met
-- **Status:** open, awaiting a human call
+- **Status:** **resolved 2026-08-12** by option 1 below, varied: the human
+  chose to fold the rotation into this branch now rather than reopen #9, so
+  #9's commit is cherry-picked as c2e41a8 and the one-feature-per-PR rule is
+  knowingly relaxed for this branch. `DECISIONS.md` records the reversal. The
+  weighted-share residual under "Also observed" stays open for Phase 2.
 - **Reverses:** `DECISIONS.md` → Rejected → "Depend on the walk-rotation fix
   (PR #9) for fairness", and the §3 / §4.2 claim that "DRR makes walk order
   irrelevant on its own ... if #9 merges the two are compatible and #9
@@ -45,7 +49,11 @@ children under one 8 Mbit/s aggregate, all saturated, 1514-byte packets:
 |---|---|---|---|
 | Spec as written | 100.0% | 36.8 / 21.2 / 21.0 / 21.0 % | **11.8 pts** |
 | Escape disabled | 85.9% | 25.0 / 25.0 / 25.0 / 25.0 % | 0.0 pts |
-| Spec + walk rotation | 100.0% | 25.3 / 25.3 / 24.7 / 24.7 % | **0.3 pts** |
+| Spec + walk rotation | 100.0% | 25.1 / 24.8 / 25.4 / 24.7 % | **0.4 pts** |
+
+The rotation row uses PR #9's actual policy — resume the walk after whichever
+scheduler last got service — not a simplified rotate-by-one. Eight equal
+children under a 16 Mbit/s aggregate land at 0.25 points by the same policy.
 
 Disabling the escape is not an option: the 14.1% of capacity it recovers is
 discarded by the aggregate gate's burst clamp, confirmed directly
@@ -100,8 +108,9 @@ consistent with the lockstep-gap explanation.
    starvation without reaching proportional fairness. Defensible only if the
    escape's allocation is documented as best-effort.
 
-Option 2 is the recommendation: it respects the scope rule, and #9 already
-carries its own hardware measurement.
+Option 2 was the recommendation; the human chose option 1 on 2026-08-12 to
+avoid the round trip, accepting the scope-rule exception. The PR description
+for this branch must call out that it carries #9's commit.
 
 ### How this was measured, and what it does not prove
 
