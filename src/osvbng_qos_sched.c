@@ -300,13 +300,21 @@ cake_agg_reparent_all (cake_main_t *cm)
 int
 cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index, u16 svlan_id,
 			     u16 svlan_id_end, u64 rate_bytes_per_sec,
-			     u32 buffer_limit)
+			     u32 weight, u32 burst_ns, u32 buffer_limit)
 {
   cake_main_t *cm = &cake_main;
   cake_aggregate_t *port, *agg;
   u32 port_idx, agg_idx;
 
   if (svlan_id_end < svlan_id || svlan_id_end >= CAKE_SVLAN_MAX)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (burst_ns == 0)
+    burst_ns = CAKE_AGG_BURST_NS;
+  if (burst_ns < CAKE_AGG_BURST_NS_MIN || burst_ns > CAKE_AGG_BURST_NS_MAX)
     return VNET_API_ERROR_INVALID_VALUE;
 
   vlib_worker_thread_barrier_sync (vm);
@@ -351,11 +359,15 @@ cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index, u16 svlan_id,
   agg->svlan_id = svlan_id;
   agg->svlan_id_end = svlan_id_end;
   agg->svlan_map = NULL;
+  agg->weight = weight ? weight : 1;
+  agg->burst_ns = burst_ns;
   agg->rate_bytes_per_sec = rate_bytes_per_sec;
   agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
   agg->drr_round_bytes = cake_drr_round_bytes (rate_bytes_per_sec);
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
-  cake_drr_shared_init (&agg->drr, rate_bytes_per_sec ? rate_bytes_per_sec : 1);
+  cake_drr_shared_init (&agg->drr,
+			cake_effective_weight (rate_bytes_per_sec,
+					       agg->weight));
 
   if (buffer_limit == 0)
     {
@@ -440,12 +452,15 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 			   u64 rate_bytes_per_sec, u8 tin_mode,
 			   i16 overhead_bytes, u8 atm_mode, u8 mpu,
 			   u32 buffer_limit, u32 target_us, u32 interval_us,
-			   u32 flags)
+			   u32 flags, u32 weight)
 {
   cake_main_t *cm = &cake_main;
 
   if (!vnet_sw_interface_is_api_valid (vnet_get_main (), sw_if_index))
     return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+
+  if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return VNET_API_ERROR_INVALID_VALUE;
 
   if (is_enable)
     {
@@ -468,11 +483,13 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 
       /* Weight defaults to the subscriber's own configured rate, so with no
        * configuration at all a 100 Mbit/s subscriber gets ten times the
-       * congested share of a 10 Mbit/s one. The operator multiplier needs the
-       * _v2 message and lands with the API phase. Floored at 1 so a
-       * rate-0 scheduler still divides. */
+       * congested share of a 10 Mbit/s one. The operator multiplier scales
+       * that rather than replacing it: replacing would make mixed
+       * configuration nonsensical, since a child set to weight 2 alongside
+       * children defaulting to their rate would be crushed. */
+      cs->weight = weight ? weight : 1;
       cs->drr.effective_weight =
-	rate_bytes_per_sec > 0 ? rate_bytes_per_sec : 1;
+	cake_effective_weight (rate_bytes_per_sec, cs->weight);
       cs->overhead_bytes = overhead_bytes;
       cs->atm_mode = atm_mode;
       cs->mpu = mpu;
@@ -640,12 +657,21 @@ cake_sched_reset_stats (u32 sw_if_index)
 
 int
 cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
-		        u64 rate_bytes_per_sec, u32 buffer_limit)
+		        u64 rate_bytes_per_sec, u32 weight, u32 burst_ns,
+		        u32 buffer_limit)
 {
   cake_main_t *cm = &cake_main;
 
   if (!vnet_sw_interface_is_api_valid (vnet_get_main (), sw_if_index))
     return VNET_API_ERROR_INVALID_SW_IF_INDEX;
+
+  if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (burst_ns == 0)
+    burst_ns = CAKE_AGG_BURST_NS;
+  if (burst_ns < CAKE_AGG_BURST_NS_MIN || burst_ns > CAKE_AGG_BURST_NS_MAX)
+    return VNET_API_ERROR_INVALID_VALUE;
 
   vlib_worker_thread_barrier_sync (vm);
 
@@ -667,11 +693,15 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
   agg->agg_index = agg_idx;
   agg->level = CAKE_AGG_LEVEL_PORT;
   agg->parent_index = ~0;
+  agg->weight = weight ? weight : 1;
+  agg->burst_ns = burst_ns;
   agg->rate_bytes_per_sec = rate_bytes_per_sec;
   agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
   agg->drr_round_bytes = cake_drr_round_bytes (rate_bytes_per_sec);
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
-  cake_drr_shared_init (&agg->drr, rate_bytes_per_sec ? rate_bytes_per_sec : 1);
+  cake_drr_shared_init (&agg->drr,
+			cake_effective_weight (rate_bytes_per_sec,
+					       agg->weight));
 
   vec_validate_init_empty (agg->svlan_map, CAKE_SVLAN_MAX - 1, ~0);
 
@@ -747,6 +777,106 @@ cake_aggregate_delete (vlib_main_t *vm, u32 sw_if_index)
   return 0;
 }
 
+/* Change rate, weight or buffer limit in place.
+ *
+ * This exists so a rate change is not delete-and-recreate, which would drop
+ * the child out of its parent's W and back in, and would take every member's
+ * attachment and outstanding charge with it. The parent's active_weight moves
+ * by the delta instead, and only while this aggregate is actually counted in
+ * it - an aggregate with no active children contributes nothing to adjust. */
+int
+cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
+		       u16 svlan_id, u64 rate_bytes_per_sec, u32 weight,
+		       u32 buffer_limit)
+{
+  cake_main_t *cm = &cake_main;
+  cake_aggregate_t *agg, *port;
+  u32 port_idx, agg_idx;
+  u64 old_weight, new_weight;
+
+  if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  if (level == CAKE_AGG_LEVEL_SVLAN && svlan_id >= CAKE_SVLAN_MAX)
+    return VNET_API_ERROR_INVALID_VALUE;
+
+  vlib_worker_thread_barrier_sync (vm);
+
+  vec_validate_init_empty (cm->agg_index_by_sw_if_index, sw_if_index, ~0);
+  port_idx = cm->agg_index_by_sw_if_index[sw_if_index];
+  if (port_idx == ~0)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_NO_SUCH_ENTRY;
+    }
+
+  if (level == CAKE_AGG_LEVEL_SVLAN)
+    {
+      port = pool_elt_at_index (cm->aggregates, port_idx);
+      agg_idx = port->svlan_map[svlan_id];
+      if (agg_idx == ~0)
+	{
+	  vlib_worker_thread_barrier_release (vm);
+	  return VNET_API_ERROR_NO_SUCH_ENTRY;
+	}
+    }
+  else
+    agg_idx = port_idx;
+
+  agg = pool_elt_at_index (cm->aggregates, agg_idx);
+
+  /* An S-VLAN may not be shaped above the port it hangs off. */
+  if (rate_bytes_per_sec && agg->parent_index != ~0 &&
+      rate_bytes_per_sec >
+	pool_elt_at_index (cm->aggregates, agg->parent_index)
+	  ->rate_bytes_per_sec)
+    {
+      vlib_worker_thread_barrier_release (vm);
+      return VNET_API_ERROR_INVALID_VALUE;
+    }
+
+  old_weight = agg->drr.effective_weight;
+
+  if (rate_bytes_per_sec)
+    {
+      agg->rate_bytes_per_sec = rate_bytes_per_sec;
+      agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
+      agg->drr_round_bytes = cake_drr_round_bytes (rate_bytes_per_sec);
+    }
+  if (weight)
+    agg->weight = weight;
+  if (buffer_limit)
+    agg->buffer_limit = buffer_limit;
+
+  new_weight =
+    cake_effective_weight (agg->rate_bytes_per_sec, agg->weight);
+  agg->drr.effective_weight = new_weight;
+
+  if (agg->parent_index != ~0 && agg->n_active_children > 0 &&
+      new_weight != old_weight)
+    {
+      cake_aggregate_t *parent =
+	pool_elt_at_index (cm->aggregates, agg->parent_index);
+
+      if (new_weight > old_weight)
+	__atomic_fetch_add (&parent->active_weight, new_weight - old_weight,
+			    __ATOMIC_RELAXED);
+      else
+	__atomic_fetch_sub (&parent->active_weight, old_weight - new_weight,
+			    __ATOMIC_RELAXED);
+    }
+
+  vlib_worker_thread_barrier_release (vm);
+
+  vlib_log_notice (cm->log_class,
+		   "aggregate updated on sw_if_index %u level %u svlan %u "
+		   "(rate %llu B/s, weight %u)",
+		   sw_if_index, level, svlan_id, agg->rate_bytes_per_sec,
+		   agg->weight);
+
+  return 0;
+}
+
 static clib_error_t *
 cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 				vlib_cli_command_t *cmd)
@@ -754,7 +884,8 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
   u32 sw_if_index = ~0;
   u64 rate_kbps = 0;
   u32 svlan_id = ~0, svlan_id_end = ~0;
-  u8 is_disable = 0;
+  u32 weight = 0, burst_ms = 0;
+  u8 is_disable = 0, is_update = 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -767,6 +898,12 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	svlan_id_end = svlan_id;
       else if (unformat (input, "rate %llu", &rate_kbps))
 	;
+      else if (unformat (input, "weight %u", &weight))
+	;
+      else if (unformat (input, "burst %u", &burst_ms))
+	;
+      else if (unformat (input, "update"))
+	is_update = 1;
       else if (unformat (input, "disable"))
 	is_disable = 1;
       else
@@ -777,8 +914,19 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
   if (sw_if_index == ~0)
     return clib_error_return (0, "interface required");
 
+  if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return clib_error_return (0, "weight must be %u-%u", CAKE_WEIGHT_MIN,
+			      CAKE_WEIGHT_MAX);
+
+  u32 burst_ns = burst_ms * 1000000;
+
   int rv;
-  if (svlan_id != ~0)
+  if (is_update)
+    rv = cake_aggregate_update (
+      vm, sw_if_index,
+      svlan_id != ~0 ? CAKE_AGG_LEVEL_SVLAN : CAKE_AGG_LEVEL_PORT,
+      svlan_id != ~0 ? (u16) svlan_id : 0, rate_kbps * 1000 / 8, weight, 0);
+  else if (svlan_id != ~0)
     {
       if (svlan_id_end < svlan_id || svlan_id_end >= CAKE_SVLAN_MAX)
 	return clib_error_return (0, "svlan range must be 0-%u ascending",
@@ -791,7 +939,8 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 	    return clib_error_return (0, "rate required (kbps)");
 	  rv = cake_svlan_aggregate_create (vm, sw_if_index, (u16) svlan_id,
 					    (u16) svlan_id_end,
-					    rate_kbps * 1000 / 8, 0);
+					    rate_kbps * 1000 / 8, weight,
+					    burst_ns, 0);
 	}
     }
   else if (is_disable)
@@ -800,7 +949,8 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
     {
       if (rate_kbps == 0)
 	return clib_error_return (0, "rate required (kbps)");
-      rv = cake_aggregate_create (vm, sw_if_index, rate_kbps * 1000 / 8, 0);
+      rv = cake_aggregate_create (vm, sw_if_index, rate_kbps * 1000 / 8,
+				  weight, burst_ns, 0);
     }
 
   if (rv)
@@ -812,7 +962,7 @@ cake_aggregate_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 VLIB_CLI_COMMAND (cake_aggregate_set_command, static) = {
   .path = "set cake aggregate",
   .short_help = "set cake aggregate <interface> [svlan <id>[-<id>]] "
-		"rate <kbps> [disable]",
+		"rate <kbps> [weight <1-256>] [burst <ms>] [update|disable]",
   .function = cake_aggregate_set_command_fn,
 };
 
@@ -855,10 +1005,10 @@ cake_agg_show_children (vlib_main_t *vm, cake_main_t *cm,
 
       vlib_cli_output (
 	vm,
-	"%s  %U: weight %llu, share %llu.%llu%%, %s, quantum %llu bytes, "
+	"%s  %U: weight %llu (x%u), share %llu.%llu%%, %s, quantum %llu bytes, "
 	"deficit %lld, drr_blocked %llu, parent_blocked %llu",
 	indent, format_vnet_sw_if_index_name, vnet_get_main (),
-	cs->sw_if_index, cs->drr.effective_weight, share_x10 / 10,
+	cs->sw_if_index, cs->drr.effective_weight, cs->weight, share_x10 / 10,
 	share_x10 % 10, cs->drr.active ? "active" : "idle",
 	cake_drr_quantum (agg->drr_round_bytes, cs->drr.effective_weight,
 			  active_weight),
@@ -895,10 +1045,11 @@ cake_aggregate_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
       if (sw_if_index != ~0 && agg->sw_if_index != sw_if_index)
 	continue;
 
-      vlib_cli_output (vm, "  %U: rate %llu B/s (%llu kbps)",
+      vlib_cli_output (vm, "  %U: rate %llu B/s (%llu kbps), burst %u ms",
 		       format_vnet_sw_if_index_name, vnet_get_main (),
 		       agg->sw_if_index, agg->rate_bytes_per_sec,
-		       agg->rate_bytes_per_sec * 8 / 1000);
+		       agg->rate_bytes_per_sec * 8 / 1000,
+		       agg->burst_ns / 1000000);
       cake_agg_show_children (vm, cm, agg, "    ");
 
       port_weight = __atomic_load_n (&agg->active_weight, __ATOMIC_RELAXED);
@@ -917,10 +1068,11 @@ cake_aggregate_show_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
 	  vlib_cli_output (
 	    vm,
-	    "    svlan %u-%u: rate %llu B/s (%llu kbps), share %llu.%llu%%",
+	    "    svlan %u-%u: rate %llu B/s (%llu kbps), weight x%u, "
+	    "burst %u ms, share %llu.%llu%%",
 	    svlan->svlan_id, svlan->svlan_id_end, svlan->rate_bytes_per_sec,
-	    svlan->rate_bytes_per_sec * 8 / 1000, share_x10 / 10,
-	    share_x10 % 10);
+	    svlan->rate_bytes_per_sec * 8 / 1000, svlan->weight,
+	    svlan->burst_ns / 1000000, share_x10 / 10, share_x10 % 10);
 	  cake_agg_show_children (vm, cm, svlan, "      ");
 	}
 
@@ -957,6 +1109,7 @@ cake_sched_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
   u8 mpu = 64;
   u8 is_disable = 0;
   u8 tin_mode = CAKE_TIN_MODE_BESTEFFORT;
+  u32 weight = 0;
 
   while (unformat_check_input (input) != UNFORMAT_END_OF_INPUT)
     {
@@ -974,6 +1127,8 @@ cake_sched_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
       else if (unformat (input, "noatm"))
 	atm_mode = 0;
       else if (unformat (input, "mpu %d", &mpu))
+	;
+      else if (unformat (input, "weight %u", &weight))
 	;
       else if (unformat (input, "besteffort"))
 	tin_mode = CAKE_TIN_MODE_BESTEFFORT;
@@ -1025,9 +1180,13 @@ cake_sched_set_command_fn (vlib_main_t *vm, unformat_input_t *input,
 
   u64 rate_bytes = rate_kbps * 1000 / 8;
 
+  if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
+    return clib_error_return (0, "weight must be %u-%u", CAKE_WEIGHT_MIN,
+			      CAKE_WEIGHT_MAX);
+
   int rv = cake_sched_enable_disable (vm, sw_if_index, !is_disable,
 				      rate_bytes, tin_mode, overhead_bytes,
-				      atm_mode, mpu, 0, 0, 0, 0);
+				      atm_mode, mpu, 0, 0, 0, 0, weight);
 
   if (rv)
     return clib_error_return (0, "cake_sched_enable_disable returned %d", rv);
@@ -1040,7 +1199,7 @@ VLIB_CLI_COMMAND (cake_sched_set_command, static) = {
   .short_help = "set cake scheduler <interface> rate <kbps> "
 		"[besteffort|diffserv3|diffserv4|diffserv8] "
 		"[overhead <bytes>|ethernet|docsis|dsl-pppoe-atm|dsl-pppoe-ptm|gpon] "
-		"[atm|ptm|noatm] [mpu <bytes>] [disable]",
+		"[atm|ptm|noatm] [mpu <bytes>] [weight <1-256>] [disable]",
   .function = cake_sched_set_command_fn,
 };
 
@@ -1166,7 +1325,7 @@ cake_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
   if (sw_if_index < vec_len (cm->sched_index_by_sw_if_index) &&
       cm->sched_index_by_sw_if_index[sw_if_index] != ~0)
     cake_sched_enable_disable (cm->vlib_main, sw_if_index, 0 /* disable */, 0,
-			       0, 0, 0, 0, 0, 0, 0, 0);
+			       0, 0, 0, 0, 0, 0, 0, 0, 0);
 
   if (sw_if_index < vec_len (cm->agg_index_by_sw_if_index) &&
       cm->agg_index_by_sw_if_index[sw_if_index] != ~0)

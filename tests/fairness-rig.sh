@@ -73,6 +73,11 @@ PG_RATE=${PG_RATE:-3000}
 # opportunity-based round robin would hand the large-frame child several times
 # its due.
 read -r -a PKT_SIZES <<< "$(echo "${PKT_SIZE:-1400}" | tr ',' ' ')"
+
+# Operator weight multipliers, cycled across subscribers. A child's share is
+# its rate times its weight, so this is the knob that lets two subscribers on
+# the same tariff be given different congested shares.
+read -r -a WEIGHTS <<< "$(echo "${SUB_WEIGHTS:-1}" | tr ',' ' ')"
 AGG_RATE=${AGG_RATE:-8000}
 read -r -a RATES <<< "${SUB_RATES:-5000 5000 5000 5000}"
 
@@ -169,12 +174,14 @@ if [ -n "${SVLANS:-}" ]; then
   done
   i=0
   for vlan in "${TAGS[@]}"; do
-    cfg set cake scheduler pg1."$vlan" rate "${TAG_RATES[$i]}" besteffort ethernet
+    cfg set cake scheduler pg1."$vlan" rate "${TAG_RATES[$i]}" besteffort ethernet \
+      weight "${WEIGHTS[$((i % ${#WEIGHTS[@]}))]}"
     i=$((i + 1))
   done
 else
   for i in "${!RATES[@]}"; do
-    cfg set cake scheduler pg1.$((100 + i)) rate "${RATES[$i]}" besteffort ethernet
+    cfg set cake scheduler pg1.$((100 + i)) rate "${RATES[$i]}" besteffort ethernet \
+      weight "${WEIGHTS[$((i % ${#WEIGHTS[@]}))]}"
   done
 fi
 
@@ -254,19 +261,23 @@ if [ -n "${SVLANS:-}" ]; then
     # The S-VLAN then divides its share by its subscribers' rates.
     sum_sub=0
     for j in $(seq 0 $((n - 1))); do
-      sum_sub=$((sum_sub + TAG_RATES[idx + j]))
+      sum_sub=$((sum_sub + TAG_RATES[idx + j] * WEIGHTS[(idx + j) % ${#WEIGHTS[@]}]))
     done
     for j in $(seq 0 $((n - 1))); do
-      EXPECT="$EXPECT $(awk -v s="$svlan_share" -v r="${TAG_RATES[$((idx + j))]}" \
+      ew=$((TAG_RATES[idx + j] * WEIGHTS[(idx + j) % ${#WEIGHTS[@]}]))
+      EXPECT="$EXPECT $(awk -v s="$svlan_share" -v r="$ew" \
         -v t="$sum_sub" -v p="$AGG_RATE" 'BEGIN { printf "%.6f", 100 * (s * r / t) / p }')"
     done
     idx=$((idx + n))
   done
 else
   sum_sub=0
-  for r in "${RATES[@]}"; do sum_sub=$((sum_sub + r)); done
-  for r in "${RATES[@]}"; do
-    EXPECT="$EXPECT $(awk -v r="$r" -v t="$sum_sub" 'BEGIN { printf "%.6f", 100 * r / t }')"
+  for i in "${!RATES[@]}"; do
+    sum_sub=$((sum_sub + RATES[i] * WEIGHTS[i % ${#WEIGHTS[@]}]))
+  done
+  for i in "${!RATES[@]}"; do
+    ew=$((RATES[i] * WEIGHTS[i % ${#WEIGHTS[@]}]))
+    EXPECT="$EXPECT $(awk -v r="$ew" -v t="$sum_sub" 'BEGIN { printf "%.6f", 100 * r / t }')"
   done
 fi
 

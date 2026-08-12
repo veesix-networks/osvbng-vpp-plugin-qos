@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **§7 Phase 2 done** — `tests/drr_harness.c`, 53 checks green. Next: §7 Phase 3, the S-VLAN tier |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **§7 Phases 2-4 done** — harness (65 checks), the S-VLAN tier, and the `_v2` binary API. All v1 message CRCs verified unchanged. Next: §7 Phase 5, the osvbng control plane |
 | Phase 6 | Code Review | Not started |
 
 ## Blocking prerequisites
@@ -137,49 +137,50 @@ Line numbers are on `feat/hqos-svlan-drr` as of ba1e335 (§7 Phases 1-2 done).
 Read context/PROCESS.md, then context/specs/hqos-svlan/README.md,
 IMPLEMENTATION_SPEC.md, DECISIONS.md and PHASE5_FINDINGS.md.
 
-Spec phases 1-4 are complete. Phase 5 implementation is under way on
-`feat/hqos-svlan-drr`:
+Spec phases 1-4 complete. Phase 5 implementation on `feat/hqos-svlan-drr`:
 
-- §7 Phase 1 (DRR on the port tier) is done and measured.
-- §7 Phase 2 (the harness) is done: tests/drr_harness.c, 53 checks.
-- §7 Phase 3 (the S-VLAN tier) is next. Nothing of it exists yet.
+- §7 Phase 1 (DRR on the port tier)   done, measured
+- §7 Phase 2 (tests/drr_harness.c)    done, 65 checks
+- §7 Phase 3 (the S-VLAN tier)        done, measured
+- §7 Phase 4 (binary API)             done, exercised via vat2
+- §7 Phase 5 (osvbng control plane)   NEXT. Nothing of it exists.
 
-This workspace CAN build and run the plugin - the README's old "no VPP
-tree" constraint is gone. Use it, and do not claim anything is verified
-that you have not run:
+The API is frozen at Phase 4's exit, which is what unblocks the control
+plane. All twelve v1 message CRCs are verified unchanged against `main`;
+twelve new messages are added. `osvbng_cake_capabilities` reports
+version 3, max_levels 2, weight 1-256, and a feature bitmap.
 
-  ../vpp                  VPP v26.06 source, the pinned DATAPLANE_VERSION
-  ../osvbng-vpp           containerised builder; copy src/* into
-                          plugins/osvbng_qos_sched/ then
-                          DOCKER_DEFAULT_PLATFORM=linux/amd64 \
-                          VPP_DEV_TARGET=osvbng_qos_sched_plugin make vpp-dev
-  tests/fairness-rig.sh   runs VPP under packet-generator load and prints
-                          per-subscriber shares against configured rate
+This workspace builds and runs the plugin. Use it:
+
+  ../vpp                  VPP v26.06, the pinned DATAPLANE_VERSION
+  ../osvbng-vpp           copy src/* into plugins/osvbng_qos_sched/ then
+                          DOCKER_DEFAULT_PLATFORM=linux/amd64 make vpp-dev
+                          (omit VPP_DEV_TARGET to rebuild the vat2 plugin too)
+  tests/fairness-rig.sh   VPP under pg load, per-subscriber shares
   tests/CMakeLists.txt    cmake -S tests -B build/tests && ctest --test-dir build/tests
 
-Read PHASE5_FINDINGS.md F5-1 before trusting any model: a standalone
-simulation predicted an 11-point fairness failure that the real dataplane
-does not have, and it was wrong enough to reverse a spec decision before
-measurement put it back. Arithmetic and concurrency invariants go in the
-harness; anything about shares or dispatch timing goes in the rig.
+Read PHASE5_FINDINGS.md first. F5-1 is a worked example of a standalone
+model predicting a fairness failure the dataplane does not have. F5-2 to
+F5-4 are three real defects the rig and harness found in the spec's design.
+F5-5 bounds what the rig can honestly measure - roughly 20 children per
+tier, because the main-thread packet generator cannot offer uniform load
+beyond that.
 
-Phase 3 work, from §4.7-§4.9:
-- cake_aggregate_t gains level/parent_index/svlan_id, the packed
-  cake_drr_shared_child_t round_deficit on its own cache line, and the
-  4096-entry per-port S-VLAN map.
-- cake_drr_shared_reserve()/refund() in cake_drr.h - one CAS over
-  (round u32 << 32 | biased deficit u32), biased by 2^31 so bounded debt
-  packs unsigned. Mirror cake_shaper_gate_take()'s loop shape. A failed
-  admission in an unchanged round must fail read-only.
-- The §4.5 five-step dequeue path with the two refund obligations, and the
-  local flag recording whether the reserve actually happened (escape
-  admissions are never refunded).
-- Attachment walk extension, backfill and per-tag detach, including the
-  buffer-charge transfer that stops a u32 underflow pinning admission shut.
-- Two-level enqueue admission with the read-only overload filter.
-- §9.3 benchmark phase pair gates this merge.
+Phase 5 work, from §6:
+- pkg/vpp/binapi/osvbng_qos_sched/ regenerated from the new API JSON
+- pkg/config/qos_aggregate.go: the `qos-aggregates` schema of §5.3, with
+  commit-time validation - interface exists, S-VLAN sets disjoint per port,
+  child rate not above parent, weight 1-256
+- pkg/conf/handlers/qos_aggregate.go: conf.Handler with Dependencies() on
+  the interface path
+- pkg/southbound/vpp/qos.go: ApplyAggregate/RemoveAggregate/UpdateAggregate,
+  ApplyScheduler moved to _v2 carrying weight, re-assert on
+  ENTRY_ALREADY_EXISTS
+- pkg/handlers/show/qos/aggregate.go: CLI plus
+  telemetry.RegisterMetric[southbound.AggregateState]
+- pkg/svcgroup/apply.go: pass the service-group weight to ApplyScheduler
 
-Extend the harness with the §9.1 rows that only become testable now:
-shared-reserve linearizability, two-level refund pairing, and the reparent
-charge transfer. Extend the rig to a two-tier topology for the shares.
+Note osvbng's own conventions differ from this repo's: Conventional Commits
+with release-please, no blocking I/O under locks, O(1) lookups on the
+session path. Read osvbng/docs/contributing/guidelines.md before starting.
 ```

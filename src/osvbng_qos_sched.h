@@ -53,8 +53,8 @@
 #define CAKE_INTERVAL_US_DEFAULT  100000
 #define CAKE_REC_INV_SQRT_CACHE	  16
 
-/* Idle credit ceiling for an aggregate shaper, at the floor of the 10-125 ms
- * range commodity shapers use. Burst credit is DRR-unarbitrated: under
+/* Default idle credit ceiling for an aggregate shaper, at the floor of the
+ * 10-125 ms range commodity shapers use. Per-aggregate since the _v2 API. Burst credit is DRR-unarbitrated: under
  * sustained sub-saturation virtual time pins at now - CAKE_AGG_BURST_NS, the
  * work-conserving escape stays continuously open, and the first
  * burst x rate bytes of every saturation onset are admitted in walk order.
@@ -62,6 +62,22 @@
  * and it is also the post-idle line-rate burst released into the access
  * network. */
 #define CAKE_AGG_BURST_NS	  (10ULL * 1000000ULL)
+#define CAKE_AGG_BURST_NS_MIN	  (10ULL * 1000000ULL)
+#define CAKE_AGG_BURST_NS_MAX	  (150ULL * 1000000ULL)
+
+/* An operator multiplier on the rate-derived weight. Bounded because the
+ * quantum's 128-bit intermediate is sized against it, and because no
+ * residential BNG case needs more. */
+#define CAKE_WEIGHT_MIN 1
+#define CAKE_WEIGHT_MAX 256
+
+static_always_inline u64
+cake_effective_weight (u64 rate_bytes_per_sec, u32 weight)
+{
+  u64 w = weight ? weight : 1;
+  u64 rate = rate_bytes_per_sec ? rate_bytes_per_sec : 1;
+  return rate * w;
+}
 
 #define CAKE_HOSTS	  256
 #define CAKE_HOSTS_MASK	  (CAKE_HOSTS - 1)
@@ -186,16 +202,14 @@ typedef struct
   u32 agg_index;
   u32 buffer_limit;
   u32 parent_index;
+  u32 burst_ns;
 
   u16 svlan_id;
   u16 svlan_id_end;
+  u16 weight;
   u8 level;
 
   cake_agg_stats_t *stats;
-
-  /* Level 0 only: CAKE_SVLAN_MAX entries of aggregate index, ~0 unmapped.
-   * O(1) lookup at attachment for ~16 KB per port. */
-  u32 *svlan_map;
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
   u64 global_shaper_time_ns;
@@ -226,6 +240,12 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline4);
   u64 active_weight;
   u32 n_active_children;
+
+  /* Level 0 only: CAKE_SVLAN_MAX entries of aggregate index, ~0 unmapped.
+   * O(1) lookup at attachment for ~16 KB per port. Read at configuration
+   * time only, so it sits here rather than displacing a per-packet field
+   * from cacheline0. */
+  u32 *svlan_map;
 } cake_aggregate_t;
 
 typedef struct
@@ -271,6 +291,7 @@ typedef struct
    * exactly one owner and only that thread dequeues it - so the deficit costs
    * no shared cache line. */
   u32 aggregate_index;
+  u32 weight;
   cake_drr_child_t drr;
 
   /* Dispatches deferred, not packets: the walk leaves the scheduler on either
@@ -320,17 +341,22 @@ int cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 			       u64 rate_bytes_per_sec, u8 tin_mode,
 			       i16 overhead_bytes, u8 atm_mode, u8 mpu,
 			       u32 buffer_limit, u32 target_us,
-			       u32 interval_us, u32 flags);
+			       u32 interval_us, u32 flags, u32 weight);
 
 void cake_sched_reset_stats (u32 sw_if_index);
 void cake_cobalt_cache_init (void);
 
 int cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
-			    u64 rate_bytes_per_sec, u32 buffer_limit);
+			    u64 rate_bytes_per_sec, u32 weight, u32 burst_ns,
+			    u32 buffer_limit);
 int cake_aggregate_delete (vlib_main_t *vm, u32 sw_if_index);
 int cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
 				 u16 svlan_id, u16 svlan_id_end,
-				 u64 rate_bytes_per_sec, u32 buffer_limit);
+				 u64 rate_bytes_per_sec, u32 weight,
+				 u32 burst_ns, u32 buffer_limit);
+int cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
+			   u16 svlan_id, u64 rate_bytes_per_sec, u32 weight,
+			   u32 buffer_limit);
 int cake_svlan_aggregate_delete (vlib_main_t *vm, u32 sw_if_index,
 				 u16 svlan_id);
 void cake_sched_resolve_attachment (cake_main_t *cm, cake_sched_t *cs);
@@ -1040,7 +1066,7 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 
   /* Step 3 */
   if (!cake_shaper_gate_take (&agg->global_shaper_time_ns, cost_ns, now_ns,
-			      CAKE_AGG_BURST_NS))
+			      agg->burst_ns))
     {
       vec_elt_at_index (agg->stats, thread_index)->parent_blocked++;
       return CAKE_PARENT_GATE_CLOSED;
@@ -1075,7 +1101,7 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
   if (!cake_shaper_gate_take (&parent->global_shaper_time_ns,
 			      cake_cost_ns (adj_len,
 					    parent->rate_ns_per_byte_scaled),
-			      now_ns, CAKE_AGG_BURST_NS))
+			      now_ns, parent->burst_ns))
     {
       /* Refunded iff the reserve actually happened: a work-conserving escape
        * admits without reserving and must never be given credit back. */
