@@ -118,12 +118,13 @@ cake_tin_init (cake_tin_t *tin, u32 quantum)
 }
 
 static void
-cake_tin_drain (vlib_main_t *vm, cake_tin_t *tin)
+cake_tin_drain (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
+		cake_tin_t *tin)
 {
   if (tin->flows)
     {
       for (u32 i = 0; i < CAKE_QUEUES; i++)
-	cake_flow_ring_free (vm, &tin->flows[i]);
+	cake_flow_discard (vm, cm, cs, tin, &tin->flows[i]);
       clib_mem_free (tin->flows);
       tin->flows = NULL;
     }
@@ -176,8 +177,7 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
       cs->sw_if_index = sw_if_index;
       cs->sched_index = pool_index;
       cs->rate_bytes_per_sec = rate_bytes_per_sec;
-      cs->rate_ns_per_byte =
-	rate_bytes_per_sec > 0 ? (u64) 1e9 / rate_bytes_per_sec : 0;
+      cs->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
       cs->overhead_bytes = overhead_bytes;
       cs->atm_mode = atm_mode;
       cs->mpu = mpu;
@@ -295,7 +295,7 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 				   sw_if_index, 0, 0, 0);
 
       for (u8 t = 0; t < cs->n_tins; t++)
-	cake_tin_drain (vm, &cs->tins[t]);
+	cake_tin_drain (vm, cm, cs, &cs->tins[t]);
       clib_mem_free (cs->tins);
       cs->tins = NULL;
 
@@ -383,8 +383,7 @@ cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
   agg->sw_if_index = sw_if_index;
   agg->agg_index = agg_idx;
   agg->rate_bytes_per_sec = rate_bytes_per_sec;
-  agg->rate_ns_per_byte =
-    rate_bytes_per_sec > 0 ? (u64) 1e9 / rate_bytes_per_sec : 0;
+  agg->rate_ns_per_byte_scaled = cake_rate_scaled (rate_bytes_per_sec);
   agg->global_shaper_time_ns = (u64) (vlib_time_now (vm) * 1e9);
 
   if (buffer_limit == 0)
@@ -760,6 +759,31 @@ osvbng_qos_sched_init (vlib_main_t *vm)
 }
 
 VLIB_INIT_FUNCTION (osvbng_qos_sched_init);
+
+/* sw_if_index values are recycled, so a scheduler outliving its interface
+ * blocks the next one to reuse the index: enable returns ENTRY_ALREADY_EXISTS
+ * while the stale entry, its feature config gone, shapes nothing. */
+static clib_error_t *
+cake_sw_interface_add_del (vnet_main_t *vnm, u32 sw_if_index, u32 is_add)
+{
+  cake_main_t *cm = &cake_main;
+
+  if (is_add)
+    return 0;
+
+  if (sw_if_index < vec_len (cm->sched_index_by_sw_if_index) &&
+      cm->sched_index_by_sw_if_index[sw_if_index] != ~0)
+    cake_sched_enable_disable (cm->vlib_main, sw_if_index, 0 /* disable */, 0,
+			       0, 0, 0, 0, 0, 0, 0, 0);
+
+  if (sw_if_index < vec_len (cm->agg_index_by_sw_if_index) &&
+      cm->agg_index_by_sw_if_index[sw_if_index] != ~0)
+    cake_aggregate_delete (cm->vlib_main, sw_if_index);
+
+  return 0;
+}
+
+VNET_SW_INTERFACE_ADD_DEL_FUNCTION (cake_sw_interface_add_del);
 
 VLIB_PLUGIN_REGISTER () = {
   .version = "6.0.0",

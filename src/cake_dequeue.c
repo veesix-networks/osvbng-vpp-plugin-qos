@@ -29,6 +29,16 @@ typedef struct
   u32 flow_idx;
 } cake_dequeue_trace_t;
 
+/* GATE_CLOSED is distinct from EMPTY because it makes no progress: retrying
+ * the same flow before now_ns is re-sampled would spin. */
+typedef enum
+{
+  CAKE_DEQ_EMPTY = 0,
+  CAKE_DEQ_SENT,
+  CAKE_DEQ_DROPPED,
+  CAKE_DEQ_GATE_CLOSED,
+} cake_deq_result_t;
+
 static u8 *
 format_cake_dequeue_trace (u8 *s, va_list *args)
 {
@@ -50,6 +60,7 @@ cake_flow_reclaim (vlib_main_t *vm, cake_tin_t *tin, cake_sched_t *cs,
   cobalt_queue_empty (f, cs->target_us, cs->p_dec, cs->interval_us, now_us);
 
   cake_flow_list_remove (list_head, list_tail, tin->flows, flow_idx);
+  /* Callers check the queue is empty, so there is no credit to release. */
   cake_flow_ring_free (vm, f);
 
   if (f->flow_state == CAKE_FLOW_SPARSE)
@@ -83,7 +94,7 @@ cake_select_flow (cake_tin_t *tin)
   return ~0;
 }
 
-static_always_inline u8
+static_always_inline cake_deq_result_t
 cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  cake_main_t *cm, cake_sched_t *cs, cake_tin_t *tin,
 		  cake_flow_t *flow, u32 now_us, u64 now_ns,
@@ -91,7 +102,7 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
 		  u32 *n_ecn_marks, u32 *random_seed)
 {
   if (cake_flow_queue_len (flow) == 0)
-    return 0;
+    return CAKE_DEQ_EMPTY;
 
   u32 bi = flow->ring[flow->head & CAKE_FLOW_RING_MASK];
   flow->head++;
@@ -143,7 +154,7 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
       (*n_aqm_drops)++;
       cake_agg_discharge (cm, cs, pkt_len);
       vlib_buffer_free_one (vm, bi);
-      return 0;
+      return CAKE_DEQ_DROPPED;
     }
 
   if (PREDICT_FALSE (ecn_marked))
@@ -158,10 +169,11 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
   if (!cake_agg_dequeue_gate (cm, cs, adj_len, now_ns, vm->thread_index))
     {
       flow->head--;
-      return 0;
+      return CAKE_DEQ_GATE_CLOSED;
     }
 
-  cs->global_shaper_time_ns += (u64) adj_len * cs->rate_ns_per_byte;
+  cs->global_shaper_time_ns +=
+    cake_cost_ns (adj_len, cs->rate_ns_per_byte_scaled);
   u64 max_shaper = now_ns + (u64) 150000000;
   if (cs->global_shaper_time_ns > max_shaper)
     cs->global_shaper_time_ns = max_shaper;
@@ -192,7 +204,7 @@ cake_dequeue_one (vlib_main_t *vm, vlib_node_runtime_t *node,
     }
 
   *out_bi = bi;
-  return 1;
+  return CAKE_DEQ_SENT;
 }
 
 VLIB_NODE_FN (cake_dequeue_node)
@@ -292,12 +304,12 @@ VLIB_NODE_FN (cake_dequeue_node)
 		  continue;
 		}
 
-	      u8 sent = cake_dequeue_one (
+	      cake_deq_result_t r = cake_dequeue_one (
 		vm, node, cm, cs, tin, flow, now_us, now_ns,
 		&out_bi[n_out], &out_nexts[n_out], &n_aqm_drops,
 		&n_ecn_marks, &pt->random_seed);
 
-	      if (sent)
+	      if (r == CAKE_DEQ_SENT)
 		{
 		  n_out++;
 		  budget--;
@@ -308,6 +320,11 @@ VLIB_NODE_FN (cake_dequeue_node)
 		cake_flow_reclaim (vm, tin, cs, flow_idx,
 				   &tin->new_flow_head,
 				   &tin->new_flow_tail, now_us);
+
+	      /* Nothing advanced, so retrying before the next dispatch
+	       * re-samples now_ns would spin. */
+	      if (r == CAKE_DEQ_GATE_CLOSED)
+		break;
 
 	      if (now_ns < cs->global_shaper_time_ns)
 		break;
@@ -345,17 +362,22 @@ VLIB_NODE_FN (cake_dequeue_node)
 		  break;
 		}
 
-	      u8 sent = cake_dequeue_one (
+	      cake_deq_result_t r = cake_dequeue_one (
 		vm, node, cm, cs, tin, flow, now_us, now_ns,
 		&out_bi[n_out], &out_nexts[n_out], &n_aqm_drops,
 		&n_ecn_marks, &pt->random_seed);
 
-	      if (sent)
+	      if (r == CAKE_DEQ_SENT)
 		{
 		  n_out++;
 		  budget--;
 		  sched_dequeued++;
 		}
+
+	      /* deficit and budget are unchanged, so this loop would spin on
+	       * the same closed gate. */
+	      if (r == CAKE_DEQ_GATE_CLOSED)
+		goto shaper_exhausted;
 
 	      if (now_ns < cs->global_shaper_time_ns)
 		goto shaper_exhausted;

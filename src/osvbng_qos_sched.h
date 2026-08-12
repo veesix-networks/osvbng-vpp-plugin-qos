@@ -50,6 +50,10 @@
 #define CAKE_INTERVAL_US_DEFAULT  100000
 #define CAKE_REC_INV_SQRT_CACHE	  16
 
+/* Idle credit ceiling for an aggregate shaper. 25 ms sits inside the
+ * 10-125 ms range commodity shapers use. */
+#define CAKE_AGG_BURST_NS	  (25ULL * 1000000ULL)
+
 #define CAKE_HOSTS	  256
 #define CAKE_HOSTS_MASK	  (CAKE_HOSTS - 1)
 
@@ -157,7 +161,7 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
   u64 rate_bytes_per_sec;
-  u64 rate_ns_per_byte;
+  u64 rate_ns_per_byte_scaled;
 
   u32 sw_if_index;
   u32 agg_index;
@@ -177,7 +181,7 @@ typedef struct
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
   u64 rate_bytes_per_sec;
-  u64 rate_ns_per_byte;
+  u64 rate_ns_per_byte_scaled;
   u64 global_shaper_time_ns;
 
   u32 sw_if_index;
@@ -699,6 +703,47 @@ cake_agg_discharge (cake_main_t *cm, cake_sched_t *cs, u32 pkt_len)
     }
 }
 
+/* ns/byte in fixed point: plain integers truncate to 0 at and above 1e9 B/s
+ * and still round 3 Gbit/s up to 4 Gbit/s. 16 fractional bits hold the error
+ * under 0.01% to 100 Gbit/s. */
+#define CAKE_RATE_FRAC_BITS 16
+
+static_always_inline u64
+cake_rate_scaled (u64 rate_bytes_per_sec)
+{
+  return rate_bytes_per_sec > 0
+	   ? (1000000000ULL << CAKE_RATE_FRAC_BITS) / rate_bytes_per_sec
+	   : 0;
+}
+
+static_always_inline u64
+cake_cost_ns (u32 adj_len, u64 rate_ns_per_byte_scaled)
+{
+  return ((u64) adj_len * rate_ns_per_byte_scaled) >> CAKE_RATE_FRAC_BITS;
+}
+
+/* Release what a flow's queued buffers hold at both levels, then free the ring.
+ * Bypassing this leaks agg->buffer_usage, which only ratchets up and
+ * eventually wedges the aggregate shut. */
+static_always_inline void
+cake_flow_discard (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
+		   cake_tin_t *tin, cake_flow_t *f)
+{
+  u32 queued = cake_flow_queue_len (f);
+
+  if (queued)
+    {
+      cake_agg_discharge (cm, cs, f->backlog_bytes);
+      cs->buffer_usage -= f->backlog_bytes;
+      cs->queued_buffers -= queued;
+      cs->dropped_pkts += queued;
+      tin->drops += queued;
+      f->backlog_bytes = 0;
+    }
+
+  cake_flow_ring_free (vm, f);
+}
+
 static_always_inline u8
 cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 			u64 now_ns, u32 thread_index)
@@ -708,21 +753,24 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 
   cake_aggregate_t *agg =
     pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-  u64 cost_ns = (u64) adj_len * agg->rate_ns_per_byte;
-  u64 old_time, new_time;
+  u64 cost_ns = cake_cost_ns (adj_len, agg->rate_ns_per_byte_scaled);
+  u64 old_time, base, new_time;
 
   do
     {
       old_time =
 	__atomic_load_n (&agg->global_shaper_time_ns, __ATOMIC_ACQUIRE);
 
-      if (old_time < now_ns)
-	old_time = now_ns;
-
       if (old_time > now_ns)
 	return 0;
 
-      new_time = old_time + cost_ns;
+      /* old_time stays as loaded: it is the CAS expected value, so clamping it
+       * would guarantee the exchange never succeeds. */
+      base = old_time;
+      if (now_ns - base > CAKE_AGG_BURST_NS)
+	base = now_ns - CAKE_AGG_BURST_NS;
+
+      new_time = base + cost_ns;
     }
   while (!__atomic_compare_exchange_n (&agg->global_shaper_time_ns, &old_time,
 					new_time, 1, __ATOMIC_ACQ_REL,

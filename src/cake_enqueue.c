@@ -51,11 +51,12 @@ format_cake_enqueue_trace (u8 *s, va_list *args)
 }
 
 static_always_inline void
-cake_flow_evict (vlib_main_t *vm, cake_tin_t *tin, u32 slot)
+cake_flow_evict (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
+		 cake_tin_t *tin, u32 slot)
 {
   cake_flow_t *ef = &tin->flows[slot];
 
-  cake_flow_ring_free (vm, ef);
+  cake_flow_discard (vm, cm, cs, tin, ef);
 
   if (ef->flow_state == CAKE_FLOW_SPARSE)
     {
@@ -223,7 +224,7 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (PREDICT_FALSE (flow_idx == ~0))
 	{
-	  cake_flow_evict (vm, tin, evict_slot);
+	  cake_flow_evict (vm, cm, cs, tin, evict_slot);
 	  tin->flow_tags[evict_slot] = tag;
 	  flow_idx = evict_slot;
 	  vlib_node_increment_counter (vm, node->node_index,
@@ -258,10 +259,14 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  cake_aggregate_t *agg =
 	    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-	  u32 usage =
-	    __atomic_load_n (&agg->buffer_usage, __ATOMIC_RELAXED);
-	  if (PREDICT_FALSE (usage + pkt_len > agg->buffer_limit))
+	  /* Load-compare-add would let every worker admit against the same
+	   * under-limit read, overshooting by one packet per worker. */
+	  u32 prev =
+	    __atomic_fetch_add (&agg->buffer_usage, pkt_len, __ATOMIC_RELAXED);
+	  if (PREDICT_FALSE (prev + pkt_len > agg->buffer_limit))
 	    {
+	      __atomic_fetch_sub (&agg->buffer_usage, pkt_len,
+				  __ATOMIC_RELAXED);
 	      cobalt_queue_full (flow, cs->target_us, cs->p_inc,
 				 (u32) (vlib_time_now (vm) * 1e6));
 	      vlib_buffer_free_one (vm, bi0);
@@ -271,8 +276,6 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      vec_elt_at_index (agg->stats, thread_index)->backpressure_events++;
 	      continue;
 	    }
-	  __atomic_fetch_add (&agg->buffer_usage, pkt_len,
-			      __ATOMIC_RELAXED);
 	}
 
       if (PREDICT_FALSE (flow->flow_state == CAKE_FLOW_NONE))
@@ -293,6 +296,9 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
       if (PREDICT_FALSE (cake_flow_queue_len (flow) >= CAKE_FLOW_RING_SIZE))
 	{
+	  /* Charged by aggregate admission above, and this buffer never
+	   * reaches a queue. */
+	  cake_agg_discharge (cm, cs, pkt_len);
 	  cobalt_queue_full (flow, cs->target_us, cs->p_inc,
 			     (u32) (vlib_time_now (vm) * 1e6));
 	  vlib_buffer_free_one (vm, bi0);
