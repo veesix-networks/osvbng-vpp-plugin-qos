@@ -29,6 +29,7 @@
 #include <vlib/vlib.h>
 
 #include <osvbng_qos_sched/cake_drr.h>
+#include <osvbng_qos_sched/cake_shaper.h>
 
 #define CAKE_BUFFER_F_SCHEDULED VNET_BUFFER_F_AVAIL1
 
@@ -731,27 +732,8 @@ cake_agg_discharge (cake_main_t *cm, cake_sched_t *cs, u32 pkt_len)
     {
       cake_aggregate_t *agg =
 	pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-      __atomic_fetch_sub (&agg->buffer_usage, pkt_len, __ATOMIC_RELAXED);
+      cake_agg_release (&agg->buffer_usage, pkt_len);
     }
-}
-
-/* ns/byte in fixed point: plain integers truncate to 0 at and above 1e9 B/s
- * and still round 3 Gbit/s up to 4 Gbit/s. 16 fractional bits hold the error
- * under 0.01% to 100 Gbit/s. */
-#define CAKE_RATE_FRAC_BITS 16
-
-static_always_inline u64
-cake_rate_scaled (u64 rate_bytes_per_sec)
-{
-  return rate_bytes_per_sec > 0
-	   ? (1000000000ULL << CAKE_RATE_FRAC_BITS) / rate_bytes_per_sec
-	   : 0;
-}
-
-static_always_inline u64
-cake_cost_ns (u32 adj_len, u64 rate_ns_per_byte_scaled)
-{
-  return ((u64) adj_len * rate_ns_per_byte_scaled) >> CAKE_RATE_FRAC_BITS;
 }
 
 /* Release what a flow's queued buffers hold at both levels, then free the ring.
@@ -809,7 +791,8 @@ cake_sched_drr_activate (cake_main_t *cm, cake_sched_t *cs)
   if (PREDICT_TRUE (cs->drr.active))
     return;
 
-  cake_drr_child_activate (&cs->drr);
+  if (!cake_drr_child_activate (&cs->drr))
+    return;
 
   if (cs->aggregate_index == ~0)
     return;
@@ -817,18 +800,15 @@ cake_sched_drr_activate (cake_main_t *cm, cake_sched_t *cs)
   cake_aggregate_t *agg =
     pool_elt_at_index (cm->aggregates, cs->aggregate_index);
 
-  __atomic_fetch_add (&agg->active_weight, cs->drr.effective_weight,
-		      __ATOMIC_RELAXED);
-  __atomic_fetch_add (&agg->n_active_children, 1, __ATOMIC_RELAXED);
+  cake_drr_parent_join (&agg->active_weight, &agg->n_active_children,
+			cs->drr.effective_weight);
 }
 
 static_always_inline void
 cake_sched_drr_deactivate (cake_main_t *cm, cake_sched_t *cs)
 {
-  if (!cs->drr.active)
+  if (!cake_drr_child_deactivate (&cs->drr))
     return;
-
-  cs->drr.active = 0;
 
   if (cs->aggregate_index == ~0)
     return;
@@ -836,9 +816,8 @@ cake_sched_drr_deactivate (cake_main_t *cm, cake_sched_t *cs)
   cake_aggregate_t *agg =
     pool_elt_at_index (cm->aggregates, cs->aggregate_index);
 
-  __atomic_fetch_sub (&agg->active_weight, cs->drr.effective_weight,
-		      __ATOMIC_RELAXED);
-  __atomic_fetch_sub (&agg->n_active_children, 1, __ATOMIC_RELAXED);
+  cake_drr_parent_leave (&agg->active_weight, &agg->n_active_children,
+			 cs->drr.effective_weight);
 }
 
 static_always_inline u8
@@ -850,28 +829,12 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 
   cake_aggregate_t *agg =
     pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-  u64 cost_ns = cake_cost_ns (adj_len, agg->rate_ns_per_byte_scaled);
-  u64 old_time, base, new_time;
 
-  do
-    {
-      old_time =
-	__atomic_load_n (&agg->global_shaper_time_ns, __ATOMIC_ACQUIRE);
-
-      if (old_time > now_ns)
-	return 0;
-
-      /* old_time stays as loaded: it is the CAS expected value, so clamping it
-       * would guarantee the exchange never succeeds. */
-      base = old_time;
-      if (now_ns - base > CAKE_AGG_BURST_NS)
-	base = now_ns - CAKE_AGG_BURST_NS;
-
-      new_time = base + cost_ns;
-    }
-  while (!__atomic_compare_exchange_n (&agg->global_shaper_time_ns, &old_time,
-					new_time, 1, __ATOMIC_ACQ_REL,
-					__ATOMIC_ACQUIRE));
+  if (!cake_shaper_gate_take (&agg->global_shaper_time_ns,
+			      cake_cost_ns (adj_len,
+					    agg->rate_ns_per_byte_scaled),
+			      now_ns, CAKE_AGG_BURST_NS))
+    return 0;
 
   cake_agg_stats_t *st = vec_elt_at_index (agg->stats, thread_index);
   st->shaped_pkts++;

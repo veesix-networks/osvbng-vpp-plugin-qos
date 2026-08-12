@@ -12,9 +12,9 @@
  *
  * DEPENDENCY CONTRACT: this header uses fixed-width integers and GCC atomic
  * builtins only. It must not reach for vlib, vnet or vppinfra, so that
- * tests/drr_harness.c can compile it against a stub clock on a plain host
- * toolchain - the only verification available in a workspace with no VPP
- * tree. Callers hand in the parent's state as values and pointers.
+ * tests/drr_harness.c can drive the shipped arithmetic under pthreads on a
+ * plain host toolchain, against a stub clock it controls. Callers hand in the
+ * parent's state as values and pointers.
  *
  * Required from the including translation unit: u8/u32/u64/i64,
  * static_always_inline.
@@ -175,13 +175,53 @@ cake_drr_local_charge (cake_drr_child_t *child, u32 adj_len)
 /* Going idle earns nothing, and forgives no debt. Both halves matter:
  * resetting debt too would let a sparse child - one whose queue drains
  * between packets, re-activating on each - send a full-size packet per round
- * regardless of its quantum. */
-static_always_inline void
+ * regardless of its quantum.
+ *
+ * Returns 1 only for the caller that performed the transition, so a parent's
+ * weight is moved exactly once however many times these are called. That is
+ * what lets the dequeue walk's defensive deactivations - a scheduler whose
+ * teardown already ran, or one owned by another thread - clear an activity
+ * bit without double-subtracting a weight that has already left. */
+static_always_inline u8
 cake_drr_child_activate (cake_drr_child_t *child)
 {
+  if (child->active)
+    return 0;
+
   if (child->deficit > 0)
     child->deficit = 0;
   child->active = 1;
+  return 1;
+}
+
+static_always_inline u8
+cake_drr_child_deactivate (cake_drr_child_t *child)
+{
+  if (!child->active)
+    return 0;
+
+  child->active = 0;
+  return 1;
+}
+
+/* The parent side of the same transition. Only these two counters are shared;
+ * they move on activation transitions rather than per packet, and they are
+ * always written together, which is why they share a cache line with each
+ * other and with nothing else. */
+static_always_inline void
+cake_drr_parent_join (u64 *active_weight, u32 *n_active_children,
+		      u64 effective_weight)
+{
+  __atomic_fetch_add (active_weight, effective_weight, __ATOMIC_RELAXED);
+  __atomic_fetch_add (n_active_children, 1, __ATOMIC_RELAXED);
+}
+
+static_always_inline void
+cake_drr_parent_leave (u64 *active_weight, u32 *n_active_children,
+		       u64 effective_weight)
+{
+  __atomic_fetch_sub (active_weight, effective_weight, __ATOMIC_RELAXED);
+  __atomic_fetch_sub (n_active_children, 1, __ATOMIC_RELAXED);
 }
 
 #endif /* __included_cake_drr_h__ */

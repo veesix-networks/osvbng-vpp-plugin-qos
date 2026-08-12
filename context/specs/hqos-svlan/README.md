@@ -17,7 +17,7 @@ pool-index order.
 | Phase 2 | Spec Refinement (Claude Fable 5, substituting Gemini) | **Complete** (2026-08-12; see [spec-reviews/CLAUDE.md](spec-reviews/CLAUDE.md) — 10 findings, all accepted) |
 | Phase 3 | Spec Critique (Codex) | **Complete** (2026-08-12, adversarial; see DECISIONS.md "Phase 3") |
 | Phase 4 | Spec Finalization | **Complete** (2026-08-12; all Phase 2 + Phase 3 findings folded in, resolutions in DECISIONS.md) |
-| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a + c2e41a8, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. Next: §7 Phase 2, the harness |
+| Phase 5 | Implementation | **§7 Phase 1 done and measured** (81be05a, 2026-08-12) — DRR on the existing port tier. Builds clean against VPP v26.06 with zero warnings incl. SIMD variants; fairness verified on a running VPP within §9.1 criteria at equal and unequal rates. **§7 Phase 2 done** — `tests/drr_harness.c`, 53 checks green. Next: §7 Phase 3, the S-VLAN tier |
 | Phase 6 | Code Review | Not started |
 
 ## Blocking prerequisites
@@ -132,55 +132,51 @@ Line numbers are on the `feat/hqos-svlan-drr` baseline (= `main` +
 
 ```
 Read context/PROCESS.md, then context/specs/hqos-svlan/README.md,
-IMPLEMENTATION_SPEC.md and DECISIONS.md.
+IMPLEMENTATION_SPEC.md, DECISIONS.md and PHASE5_FINDINGS.md.
 
-Spec phases 1-4 are complete (Codex adversarial critique and Claude Fable 5
-deep review, both 2026-08-12; finalization 2026-08-12 — all findings from
-both reviews accepted and folded in, every resolution in DECISIONS.md). We
-are starting Phase 5 implementation. No implementation code has been written
-yet.
+Spec phases 1-4 are complete. Phase 5 implementation is under way on
+`feat/hqos-svlan-drr`:
 
-Git state — check it before assuming:
-- `spec/hqos-svlan`: the finalized docs (8c9366f review, 28ef09c
-  finalization).
-- `feat/hqos-svlan-drr`: branched from it, with
-  `fix/aggregate-shaper-correctness` merged as the implementation baseline
-  (ae8ed7c). That branch stacks qos #4/#5/#6/#7; the human decided on
-  2026-08-12 to proceed assuming they merge. Work here.
-- Confirm the four PRs are still unmerged/unchanged; if any changed
-  materially, rebase rather than reconciling by hand.
+- §7 Phase 1 (DRR on the port tier) is done and measured.
+- §7 Phase 2 (the harness) is done: tests/drr_harness.c, 53 checks.
+- §7 Phase 3 (the S-VLAN tier) is next. Nothing of it exists yet.
 
-Start with the spec's §7 Phase 1 — DRR on the existing port tier
-(cake_drr_child_t, cake_drr_local_admit, weight accounting at the three
-sites, CAKE_DEQ_DRR_BLOCKED, counters, CLI weight/share display). Weights
-derive from configured rate only; the explicit multiplier needs the _v2
-message and lands in §7 Phase 4. This closes issue #8 on its own and is the
-phase that proves the mechanism. Then §7 Phase 2, the harness, before the
-S-VLAN tier.
+This workspace CAN build and run the plugin - the README's old "no VPP
+tree" constraint is gone. Use it, and do not claim anything is verified
+that you have not run:
 
-Build constraint: this workspace has no VPP tree, so plugin C cannot be
-compiled or run here. Keep the DRR core free of vlib/vnet dependencies
-beyond fixed-width types so tests/drr_harness.c compiles and runs standalone
-against a stub clock — that is the only local verification available. Do not
-claim the plugin builds without a VPP environment to build it in.
+  ../vpp                  VPP v26.06 source, the pinned DATAPLANE_VERSION
+  ../osvbng-vpp           containerised builder; copy src/* into
+                          plugins/osvbng_qos_sched/ then
+                          DOCKER_DEFAULT_PLATFORM=linux/amd64 \
+                          VPP_DEV_TARGET=osvbng_qos_sched_plugin make vpp-dev
+  tests/fairness-rig.sh   runs VPP under packet-generator load and prints
+                          per-subscriber shares against configured rate
+  tests/CMakeLists.txt    cmake -S tests -B build/tests && ctest --test-dir build/tests
 
-Review-derived details that are easy to miss when skimming the spec:
+Read PHASE5_FINDINGS.md F5-1 before trusting any model: a standalone
+simulation predicted an 11-point fairness failure that the real dataplane
+does not have, and it was wrong enough to reverse a spec decision before
+measurement put it back. Arithmetic and concurrency invariants go in the
+harness; anything about shares or dispatch timing goes in the rig.
 
-1. DRR eligibility is deficit > 0 with the full adj_len subtracted and
-   bounded debt carried (biased packed word for the shared child); activation
-   clamps min(deficit, 0), which forgives no debt. The refill cap and addend
-   must be signed — a u64 operand promotes a negative deficit and silently
-   forgives the debt. §4.3-4.4.
-2. The step-2 DRR check runs before cobalt_should_drop and the ECN mark in
-   cake_dequeue_one; the escape is consulted only after the eligibility
-   check or reserve refuses, and is written in addition form. §4.4-4.5.
-3. Weight moves only on empty-detect (cake_dequeue.c:282,290) and teardown
-   deactivations — never on the defensive bitmap-clear paths (pool-free
-   :244, owner-mismatch :252), and never in the shared clear loop at :415
-   that all of them funnel through. §4.9.
-4. active_weight/n_active_children live on their own cache line (cacheline4,
-   not cacheline0 — activation frequency tracks sparse traffic, not config);
-   weight is validated 1-256 and quantum uses a 128-bit intermediate; the
-   aggregate burst default is 10 ms; the enqueue admission gets a read-only
-   overload filter in front of fetch-add-verify. §4.3, §4.7, §4.10, §8.
+Phase 3 work, from §4.7-§4.9:
+- cake_aggregate_t gains level/parent_index/svlan_id, the packed
+  cake_drr_shared_child_t round_deficit on its own cache line, and the
+  4096-entry per-port S-VLAN map.
+- cake_drr_shared_reserve()/refund() in cake_drr.h - one CAS over
+  (round u32 << 32 | biased deficit u32), biased by 2^31 so bounded debt
+  packs unsigned. Mirror cake_shaper_gate_take()'s loop shape. A failed
+  admission in an unchanged round must fail read-only.
+- The §4.5 five-step dequeue path with the two refund obligations, and the
+  local flag recording whether the reserve actually happened (escape
+  admissions are never refunded).
+- Attachment walk extension, backfill and per-tag detach, including the
+  buffer-charge transfer that stops a u32 underflow pinning admission shut.
+- Two-level enqueue admission with the read-only overload filter.
+- §9.3 benchmark phase pair gates this merge.
+
+Extend the harness with the §9.1 rows that only become testable now:
+shared-reserve linearizability, two-level refund pairing, and the reparent
+charge transfer. Extend the rig to a two-tier topology for the shares.
 ```
