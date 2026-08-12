@@ -108,25 +108,28 @@ rig, not the harness.
 
 ## Codebase Entry Points
 
-Line numbers are on the `feat/hqos-svlan-drr` baseline (= `main` +
-`fix/aggregate-shaper-correctness`), not on `main`.
+Line numbers are on `feat/hqos-svlan-drr` as of ba1e335 (§7 Phases 1-2 done).
 
 | Path | Relevance |
 |---|---|
-| `src/osvbng_qos_sched.h:159` | `cake_aggregate_t` — cache-line layout to preserve; gains `level`/`parent_index`/`svlan_id`/`weight` (cl0), activation pair (cl4), `drr.round_deficit` (cl3) |
-| `src/osvbng_qos_sched.h:179` | `cake_sched_t` — gains one `cake_drr_child_t`, `weight`, `agg_svlan_index` |
-| `src/osvbng_qos_sched.h:220` | `cake_per_thread_t` |
-| `src/osvbng_qos_sched.h:696` | `cake_agg_discharge` — resolves via *current* attachment; why reparenting must transfer charges |
-| `src/osvbng_qos_sched.h:729` | `cake_flow_discard` (from #5) — the wholesale-release path the parent-chain walk must generalise |
-| `src/osvbng_qos_sched.h:748` | `cake_agg_dequeue_gate` — the CAS loop shape `cake_drr_shared_reserve` mirrors |
-| `src/cake_dequeue.c:239` | the bitmap walk whose stable order causes #8 |
-| `src/cake_dequeue.c:244,252` | **defensive** deactivations (pool-free, owner-mismatch) — clear the bit, never move weight (§4.9) |
-| `src/cake_dequeue.c:282,290` | **empty-detect** deactivations — these are the weight-bearing ones |
-| `src/cake_dequeue.c:415` | the shared bitmap-clear loop both kinds funnel through — do not attach weight accounting here |
-| `src/cake_enqueue.c:258` | aggregate buffer admission — gains the read-only overload filter and the second level |
-| `src/cake_enqueue.c:353` | activation site — weight accounting |
-| `src/osvbng_qos_sched.c:239` | `sup_sw_if_index` attachment walk — extended for the S-VLAN hop |
-| `src/osvbng_qos_sched.c:305` | teardown deactivation — weight accounting |
+| `src/cake_drr.h` | the DRR core, dependency-free by contract; gains `cake_drr_shared_child_t`, `cake_drr_shared_reserve()`, `cake_drr_shared_refund()` |
+| `src/cake_shaper.h` | rate/cost, the gate CAS, buffer admission — same contract; `cake_shaper_gate_take` is the loop shape the shared reserve mirrors |
+| `src/osvbng_qos_sched.h:167` | `cake_aggregate_t` — cache-line layout to preserve; gains `level`/`parent_index`/`svlan_id`/`weight` (cl0) and `drr.round_deficit` on its own line, beside the existing activation pair |
+| `src/osvbng_qos_sched.h:199` | `cake_sched_t` — has `drr`, `aggregate_index`; gains `agg_svlan_index` and `weight` |
+| `src/osvbng_qos_sched.h:729` | `cake_agg_discharge` — resolves via *current* attachment; why reparenting must transfer charges |
+| `src/osvbng_qos_sched.h:743` | `cake_flow_discard` — the wholesale-release path the parent-chain walk must generalise |
+| `src/osvbng_qos_sched.h:765` | `cake_sched_drr_admit` — binds the core to a scheduler; gains the S-VLAN hop |
+| `src/osvbng_qos_sched.h:824` | `cake_agg_dequeue_gate` — becomes two-level with a refund |
+| `src/cake_dequeue.c:284` | the bitmap walk; order left alone deliberately, see the comment there |
+| `src/cake_dequeue.c:291,299` | **defensive** deactivations (pool-free, owner-mismatch) — clear the bit, never move weight (§4.9) |
+| `src/cake_dequeue.c:330,339` | **empty-detect** deactivations — these are the weight-bearing ones |
+| `src/cake_dequeue.c:485` | the shared bitmap-clear loop both kinds funnel through — do not attach weight accounting here |
+| `src/cake_enqueue.c:263` | aggregate buffer admission — gains the read-only overload filter and the second level |
+| `src/cake_enqueue.c:351` | activation site — weight accounting |
+| `src/osvbng_qos_sched.c:247` | `sup_sw_if_index` attachment walk — extended for the S-VLAN hop |
+| `src/osvbng_qos_sched.c:314` | teardown deactivation — weight accounting |
+| `tests/drr_harness.c` | §9.1 arithmetic and concurrency; gains the shared-reserve and refund rows |
+| `tests/fairness-rig.sh` | §9.2 shares against a running VPP; gains a two-tier topology |
 
 ## Prompt to Resume
 
