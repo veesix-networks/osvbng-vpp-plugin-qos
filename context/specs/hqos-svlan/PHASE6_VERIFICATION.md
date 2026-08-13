@@ -78,9 +78,26 @@ Getting there surfaced four defects, none in this spec's code:
 4. The osvbng image lacks `ethtool`/`tcpdump`, which made the wire-level
    debugging above needlessly indirect.
 
-Still unrun: an S-VLAN aggregate under a *session* topology (no suite
-configures `qos-aggregate` yet — a suite-19 variant with two S-VLANs is
-the natural follow-up), and everything multi-worker.
+**Aggregates under sessions (2026-08-13): suite 51-ipoe-hqos-svlan, 7/7.**
+Six bngblaster IPoE sessions across three S-VLANs under a shaped port,
+aggregates programmed from the `qos-aggregates` conf schema at startup,
+downstream streams saturating the hierarchy. Every arbitration
+relationship measured at once — oversubscribed port (6000+3000+3000
+asking 8000), unequal and equal S-VLAN pairs, unequal (1:4) and equal
+subscribers:
+
+| tier | worst error |
+|---|---|
+| S-VLAN split (50/25/25) | 0.05 pts |
+| subscriber split (10/40/12.5×4) | 0.20 pts |
+| port rate | 8003 of 8000 kbps |
+
+Same accuracy class as the §9.2 pg rig, now through real sessions. Its
+first deploys also caught two control-plane defects in this branch's conf
+handler (nil dataplane-state deref at startup load; a per-name dependency
+declaration the resolver cannot express), both fixed on the branch.
+
+Still unrun: everything multi-worker.
 
 ## Review inventory
 
