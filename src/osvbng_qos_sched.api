@@ -6,7 +6,7 @@
  * CAKE-equivalent per-subscriber traffic scheduling.
  */
 
-option version = "2.0.0";
+option version = "3.0.0";
 import "vnet/interface_types.api";
 
 enum osvbng_cake_tin_mode : u8
@@ -142,4 +142,187 @@ define osvbng_cake_aggregate_details
   u64 shaped_pkts;
   u64 shaped_bytes;
   u64 backpressure_events;
+};
+
+/* ---------------------------------------------------------------------------
+ * Two-tier messages, all named <object>_v2_<verb>.
+ *
+ * VPP upstream mixes the two forms - gre_tunnel_add_del_v2 sits beside
+ * gre_tunnel_v2_dump in the same file - because only the dump/details pairing
+ * is inferred from the name. One form throughout is easier to read than
+ * matching upstream's inconsistency.
+ *
+ * New messages rather than added fields: message CRCs are checked at runtime,
+ * so extending a shipped message breaks every control plane built against it.
+ * The v1 messages above are retained verbatim and remain functional against
+ * the port tier; they are deprecated.
+ * ------------------------------------------------------------------------ */
+
+enum osvbng_cake_agg_level : u8
+{
+  OSVBNG_CAKE_AGG_LEVEL_PORT = 0,
+  OSVBNG_CAKE_AGG_LEVEL_SVLAN = 1,
+};
+
+enumflag osvbng_cake_feature : u32
+{
+  OSVBNG_CAKE_FEATURE_NONE = 0x0,
+  OSVBNG_CAKE_FEATURE_SVLAN_TIER = 0x1,
+  OSVBNG_CAKE_FEATURE_WEIGHTED_DRR = 0x2,
+  OSVBNG_CAKE_FEATURE_AGG_BURST = 0x4,
+  OSVBNG_CAKE_FEATURE_AGG_UPDATE = 0x8,
+};
+
+/** \brief Create an aggregate shaper at either tier
+    @param sw_if_index - the physical or bond port, for both levels
+    @param level - port, or an S-VLAN hanging off that port
+    @param svlan_id - first tag, level 1 only
+    @param svlan_id_end - last tag; equal to svlan_id for a single tag
+    @param rate_bytes_per_sec - shaping rate; an S-VLAN may not exceed its port
+    @param weight - operator multiplier on the rate-derived weight, 1-256,
+                    0 for the default of 1
+    @param burst_ns - idle credit ceiling, 10-150 ms, 0 for the default
+    @param buffer_limit - max buffered bytes, 0 to derive from rate
+*/
+autoreply define osvbng_cake_aggregate_v2_create
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_osvbng_cake_agg_level_t level;
+  u16 svlan_id;
+  u16 svlan_id_end;
+  u64 rate_bytes_per_sec;
+  u32 weight;
+  u32 burst_ns;
+  u32 buffer_limit;
+};
+
+/** \brief Delete an aggregate shaper at either tier
+    @param sw_if_index - the port the aggregate belongs to
+    @param level - port, or an S-VLAN hanging off it
+    @param svlan_id - any tag the S-VLAN owns, level 1 only
+
+    Deleting a port with S-VLANs beneath it is refused; take those down first.
+*/
+autoreply define osvbng_cake_aggregate_v2_delete
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_osvbng_cake_agg_level_t level;
+  u16 svlan_id;
+};
+
+/** \brief Change rate, weight, burst or buffer limit in place
+    @param rate_bytes_per_sec - 0 to leave unchanged
+    @param weight - 0 to leave unchanged
+    @param burst_ns - 0 to leave unchanged
+    @param buffer_limit - 0 to leave unchanged
+
+    Exists so a rate change is not delete-and-recreate, which would drop the
+    aggregate out of its parent's active weight and take every member's
+    attachment and outstanding buffer charge with it.
+*/
+autoreply define osvbng_cake_aggregate_v2_update
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_osvbng_cake_agg_level_t level;
+  u16 svlan_id;
+  u64 rate_bytes_per_sec;
+  u32 weight;
+  u32 burst_ns;
+  u32 buffer_limit;
+};
+
+/** \brief Dump aggregate shapers at both tiers
+    @param sw_if_index - port to report, ~0 for all
+*/
+define osvbng_cake_aggregate_v2_dump
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+};
+
+/** \brief Aggregate shaper details at either tier
+    @param parent_sw_if_index - the port, for an S-VLAN; ~0 for a port
+    @param active_weight - sum of the effective weights of active children
+    @param n_active_children - children currently competing for this rate
+    @param drr_blocked - dispatches deferred because this tier had spent its
+                         share of the tier above
+    @param parent_blocked - dispatches deferred because this tier was at its
+                            own configured rate
+*/
+define osvbng_cake_aggregate_v2_details
+{
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  vl_api_osvbng_cake_agg_level_t level;
+  vl_api_interface_index_t parent_sw_if_index;
+  u16 svlan_id;
+  u16 svlan_id_end;
+  u64 rate_bytes_per_sec;
+  u32 weight;
+  u32 burst_ns;
+  u32 buffer_usage;
+  u32 buffer_limit;
+  u64 effective_weight;
+  u64 active_weight;
+  u32 n_active_children;
+  u64 shaped_pkts;
+  u64 shaped_bytes;
+  u64 backpressure_events;
+  u64 drr_blocked;
+  u64 parent_blocked;
+};
+
+/** \brief Enable or disable a subscriber scheduler, with a weight
+    @param weight - operator multiplier on the rate-derived weight, 1-256,
+                    0 for the default of 1
+
+    Identical to the v1 message but for the weight. Carried on the same
+    message rather than a separate set-weight call because session setup is a
+    declared control-plane hot path and a second round trip per bring-up is
+    not affordable.
+*/
+autoreply define osvbng_cake_sched_v2_enable_disable
+{
+  u32 client_index;
+  u32 context;
+  vl_api_interface_index_t sw_if_index;
+  bool is_enable;
+  u64 rate_bytes_per_sec;
+  vl_api_osvbng_cake_tin_mode_t tin_mode;
+  i16 overhead_bytes;
+  vl_api_osvbng_cake_atm_mode_t atm_mode;
+  u8 mpu;
+  u32 buffer_limit;
+  u32 target_us;
+  u32 interval_us;
+  vl_api_osvbng_cake_flags_t flags;
+  u32 weight;
+};
+
+/** \brief Ask what this dataplane supports
+    Lets a control plane discover the S-VLAN tier rather than assume it.
+*/
+define osvbng_cake_capabilities
+{
+  u32 client_index;
+  u32 context;
+};
+
+define osvbng_cake_capabilities_reply
+{
+  u32 context;
+  i32 retval;
+  u32 version;
+  u8 max_levels;
+  u32 max_svlan_id;
+  u32 weight_min;
+  u32 weight_max;
+  vl_api_osvbng_cake_feature_t features;
 };

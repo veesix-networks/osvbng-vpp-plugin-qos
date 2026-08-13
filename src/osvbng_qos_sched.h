@@ -28,6 +28,9 @@
 #include <vnet/buffer.h>
 #include <vlib/vlib.h>
 
+#include <osvbng_qos_sched/cake_drr.h>
+#include <osvbng_qos_sched/cake_shaper.h>
+
 #define CAKE_BUFFER_F_SCHEDULED VNET_BUFFER_F_AVAIL1
 
 #define CAKE_QUEUES	  1024
@@ -50,9 +53,31 @@
 #define CAKE_INTERVAL_US_DEFAULT  100000
 #define CAKE_REC_INV_SQRT_CACHE	  16
 
-/* Idle credit ceiling for an aggregate shaper. 25 ms sits inside the
- * 10-125 ms range commodity shapers use. */
-#define CAKE_AGG_BURST_NS	  (25ULL * 1000000ULL)
+/* Default idle credit ceiling for an aggregate shaper, at the floor of the
+ * 10-125 ms range commodity shapers use. Per-aggregate since the _v2 API. Burst credit is DRR-unarbitrated: under
+ * sustained sub-saturation virtual time pins at now - CAKE_AGG_BURST_NS, the
+ * work-conserving escape stays continuously open, and the first
+ * burst x rate bytes of every saturation onset are admitted in walk order.
+ * A wider window buys back the very starvation this tier exists to remove,
+ * and it is also the post-idle line-rate burst released into the access
+ * network. */
+#define CAKE_AGG_BURST_NS	  (10ULL * 1000000ULL)
+#define CAKE_AGG_BURST_NS_MIN	  (10ULL * 1000000ULL)
+#define CAKE_AGG_BURST_NS_MAX	  (150ULL * 1000000ULL)
+
+/* An operator multiplier on the rate-derived weight. Bounded because the
+ * quantum's 128-bit intermediate is sized against it, and because no
+ * residential BNG case needs more. */
+#define CAKE_WEIGHT_MIN 1
+#define CAKE_WEIGHT_MAX 256
+
+static_always_inline u64
+cake_effective_weight (u64 rate_bytes_per_sec, u32 weight)
+{
+  u64 w = weight ? weight : 1;
+  u64 rate = rate_bytes_per_sec ? rate_bytes_per_sec : 1;
+  return rate * w;
+}
 
 #define CAKE_HOSTS	  256
 #define CAKE_HOSTS_MASK	  (CAKE_HOSTS - 1)
@@ -150,7 +175,16 @@ typedef struct
   u64 shaped_pkts;
   u64 shaped_bytes;
   u64 backpressure_events;
+  u64 drr_blocked;
+  u64 parent_blocked;
 } cake_agg_stats_t;
+
+#define CAKE_AGG_LEVEL_PORT  0
+#define CAKE_AGG_LEVEL_SVLAN 1
+
+/* Tags an 802.1Q S-VLAN map can hold. level is an enum, not a depth counter:
+ * a third tier would need the parent chain generalised, not a bigger number. */
+#define CAKE_SVLAN_MAX 4096
 
 /* Every worker shaping into an aggregate touches this struct per packet, so
  * the two genuinely-shared atomics each get their own line and the counters
@@ -162,10 +196,18 @@ typedef struct
 
   u64 rate_bytes_per_sec;
   u64 rate_ns_per_byte_scaled;
+  u64 drr_round_bytes;
 
   u32 sw_if_index;
   u32 agg_index;
   u32 buffer_limit;
+  u32 parent_index;
+  u32 burst_ns;
+
+  u16 svlan_id;
+  u16 svlan_id_end;
+  u16 weight;
+  u8 level;
 
   cake_agg_stats_t *stats;
 
@@ -174,6 +216,36 @@ typedef struct
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline2);
   u32 buffer_usage;
+
+  /* This aggregate's own state as a child of parent_index, CAS-written per
+   * packet by whichever worker dequeues any of its members. The one genuinely
+   * new shared per-packet write the S-VLAN tier adds, so it takes its own line
+   * rather than reintroducing the bounce 7c04b13 removed.
+   *
+   * Kept whole rather than splitting effective_weight into the read-mostly
+   * group: the weight is read exclusively during a refill, by the same worker
+   * that is about to CAS the word beside it, so splitting them would touch
+   * two lines where one does. */
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline3);
+  cake_drr_shared_child_t drr;
+
+  /* Activation transitions track traffic, not configuration: a scheduler
+   * deactivates the moment its queues drain and re-activates on the next
+   * packet, so a 50 pps VoIP-only subscriber toggles once per packet, and a
+   * single-member S-VLAN propagates each toggle to the port. Sharing
+   * cacheline0 these writes would invalidate - at sparse-traffic rate - the
+   * line every worker reads per packet for rate_ns_per_byte_scaled and
+   * buffer_limit. The two share a line with each other because they are
+   * always written together. */
+  CLIB_CACHE_LINE_ALIGN_MARK (cacheline4);
+  u64 active_weight;
+  u32 n_active_children;
+
+  /* Level 0 only: CAKE_SVLAN_MAX entries of aggregate index, ~0 unmapped.
+   * O(1) lookup at attachment for ~16 KB per port. Read at configuration
+   * time only, so it sits here rather than displacing a per-packet field
+   * from cacheline0. */
+  u32 *svlan_map;
 } cake_aggregate_t;
 
 typedef struct
@@ -214,7 +286,20 @@ typedef struct
   u64 dequeued_bytes;
   u64 dropped_pkts;
 
+  /* Read together on the dequeue path: resolve the parent, then test this
+   * scheduler's share of it. Owner-thread-local end to end - a scheduler has
+   * exactly one owner and only that thread dequeues it - so the deficit costs
+   * no shared cache line. */
   u32 aggregate_index;
+  u32 weight;
+  cake_drr_child_t drr;
+
+  /* Dispatches deferred, not packets: the walk leaves the scheduler on either
+   * outcome and retries next dispatch. Counted apart because they mean
+   * different things - drr_blocked is "your siblings are using the capacity",
+   * parent_blocked is "the parent is full". */
+  u64 drr_blocked;
+  u64 parent_blocked;
 } cake_sched_t;
 
 typedef struct
@@ -256,14 +341,25 @@ int cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 			       u64 rate_bytes_per_sec, u8 tin_mode,
 			       i16 overhead_bytes, u8 atm_mode, u8 mpu,
 			       u32 buffer_limit, u32 target_us,
-			       u32 interval_us, u32 flags);
+			       u32 interval_us, u32 flags, u32 weight);
 
 void cake_sched_reset_stats (u32 sw_if_index);
 void cake_cobalt_cache_init (void);
 
 int cake_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
-			    u64 rate_bytes_per_sec, u32 buffer_limit);
+			    u64 rate_bytes_per_sec, u32 weight, u32 burst_ns,
+			    u32 buffer_limit);
 int cake_aggregate_delete (vlib_main_t *vm, u32 sw_if_index);
+int cake_svlan_aggregate_create (vlib_main_t *vm, u32 sw_if_index,
+				 u16 svlan_id, u16 svlan_id_end,
+				 u64 rate_bytes_per_sec, u32 weight,
+				 u32 burst_ns, u32 buffer_limit);
+int cake_aggregate_update (vlib_main_t *vm, u32 sw_if_index, u8 level,
+			   u16 svlan_id, u64 rate_bytes_per_sec, u32 weight,
+			   u32 burst_ns, u32 buffer_limit);
+int cake_svlan_aggregate_delete (vlib_main_t *vm, u32 sw_if_index,
+				 u16 svlan_id);
+void cake_sched_resolve_attachment (cake_main_t *cm, cake_sched_t *cs);
 
 static_always_inline u32
 cake_overhead_adjust (cake_sched_t *cs, u32 pkt_len)
@@ -692,34 +788,67 @@ cake_ecn_mark (vlib_buffer_t *b)
     }
 }
 
+/* Release at every tier the packet was charged to. Resolves through the
+ * scheduler's *current* attachment, which is why reparenting a scheduler that
+ * still holds charged packets has to transfer the charge with it. */
 static_always_inline void
 cake_agg_discharge (cake_main_t *cm, cake_sched_t *cs, u32 pkt_len)
 {
-  if (cs->aggregate_index != ~0)
+  u32 idx = cs->aggregate_index;
+
+  while (idx != ~0)
     {
-      cake_aggregate_t *agg =
-	pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-      __atomic_fetch_sub (&agg->buffer_usage, pkt_len, __ATOMIC_RELAXED);
+      cake_aggregate_t *agg = pool_elt_at_index (cm->aggregates, idx);
+      cake_agg_release (&agg->buffer_usage, pkt_len);
+      idx = agg->parent_index;
     }
 }
 
-/* ns/byte in fixed point: plain integers truncate to 0 at and above 1e9 B/s
- * and still round 3 Gbit/s up to 4 Gbit/s. 16 fractional bits hold the error
- * under 0.01% to 100 Gbit/s. */
-#define CAKE_RATE_FRAC_BITS 16
-
-static_always_inline u64
-cake_rate_scaled (u64 rate_bytes_per_sec)
+/* Charge every tier, unwinding the ones already taken if a later one refuses.
+ *
+ * A read-only overload filter fronts each level: at an already-full queue a
+ * marginally early or late drop is the outcome regardless, and without it
+ * sustained incast pays four RMWs per rejected packet on the two hottest
+ * lines, from every worker, at *offered* rate. Every admission still goes
+ * through the exact fetch-add-then-verify, so the pre-#5 over-admission race
+ * does not come back. */
+static_always_inline u8
+cake_agg_admit_chain (cake_main_t *cm, cake_sched_t *cs, u32 pkt_len,
+		      u32 thread_index)
 {
-  return rate_bytes_per_sec > 0
-	   ? (1000000000ULL << CAKE_RATE_FRAC_BITS) / rate_bytes_per_sec
-	   : 0;
-}
+  cake_aggregate_t *agg, *parent;
 
-static_always_inline u64
-cake_cost_ns (u32 adj_len, u64 rate_ns_per_byte_scaled)
-{
-  return ((u64) adj_len * rate_ns_per_byte_scaled) >> CAKE_RATE_FRAC_BITS;
+  if (cs->aggregate_index == ~0)
+    return 1;
+
+  agg = pool_elt_at_index (cm->aggregates, cs->aggregate_index);
+
+  if (PREDICT_FALSE (__atomic_load_n (&agg->buffer_usage, __ATOMIC_RELAXED) >
+		     agg->buffer_limit) ||
+      PREDICT_FALSE (
+	!cake_agg_admit (&agg->buffer_usage, agg->buffer_limit, pkt_len)))
+    {
+      vec_elt_at_index (agg->stats, thread_index)->backpressure_events++;
+      return 0;
+    }
+
+  if (agg->parent_index == ~0)
+    return 1;
+
+  parent = pool_elt_at_index (cm->aggregates, agg->parent_index);
+
+  if (PREDICT_FALSE (__atomic_load_n (&parent->buffer_usage,
+				      __ATOMIC_RELAXED) >
+		     parent->buffer_limit) ||
+      PREDICT_FALSE (!cake_agg_admit (&parent->buffer_usage,
+				      parent->buffer_limit, pkt_len)))
+    {
+      cake_agg_release (&agg->buffer_usage, pkt_len);
+      vec_elt_at_index (parent->stats, thread_index)->backpressure_events++;
+      return 0;
+    }
+
+  return 1;
 }
 
 /* Release what a flow's queued buffers hold at both levels, then free the ring.
@@ -744,50 +873,264 @@ cake_flow_discard (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
   cake_flow_ring_free (vm, f);
 }
 
-static_always_inline u8
+/* Bind the dependency-free DRR core to a scheduler and the aggregate it
+ * competes in. A scheduler with no aggregate has nothing to arbitrate
+ * against, so it admits without charging. */
+/* Bytes a tier can actually pass in a round, which is its configured rate only
+ * while nothing above it is throttling it.
+ *
+ * Deriving a child's quantum from its parent's *configured* rate is right
+ * for the port, and wrong for any tier under an oversubscribed parent - the
+ * ordinary HQoS case. An S-VLAN provisioned at port rate but
+ * winning half the port hands each of its children a quantum sized for the
+ * whole S-VLAN rate, so no child's deficit ever runs out, every child stays
+ * permanently eligible, and the tier stops arbitrating: measured, one child of
+ * two took 49.9% of the port and the other 0.12%.
+ *
+ * Folding the parent's own share in makes the quanta beneath it sum to what
+ * the tier really gets. Evaluated once per child per round, on the refill
+ * path, never per packet. */
+static_always_inline u64
+cake_agg_effective_round_bytes (cake_main_t *cm, cake_aggregate_t *agg)
+{
+  u64 round_bytes = agg->drr_round_bytes;
+  cake_aggregate_t *parent;
+  u64 share;
+
+  if (agg->parent_index == ~0)
+    return round_bytes;
+
+  parent = pool_elt_at_index (cm->aggregates, agg->parent_index);
+  share = cake_drr_quantum (
+    parent->drr_round_bytes, agg->drr.effective_weight,
+    __atomic_load_n (&parent->active_weight, __ATOMIC_RELAXED));
+
+  return share < round_bytes ? share : round_bytes;
+}
+
+static_always_inline cake_drr_admit_t
+cake_sched_drr_admit (cake_main_t *cm, cake_sched_t *cs, u64 now_ns)
+{
+  cake_aggregate_t *agg;
+  u64 idle_vt, round_bytes = 0;
+
+  if (cs->aggregate_index == ~0)
+    return CAKE_DRR_UNARBITRATED;
+
+  agg = pool_elt_at_index (cm->aggregates, cs->aggregate_index);
+
+  /* Only the refill consumes round_bytes, so only a round boundary pays for
+   * resolving what the parent can really pass. */
+  if (PREDICT_FALSE (cs->drr.round != cake_drr_round (now_ns)))
+    round_bytes = cake_agg_effective_round_bytes (cm, agg);
+
+  idle_vt = __atomic_load_n (&agg->global_shaper_time_ns, __ATOMIC_RELAXED);
+
+  /* The work-conserving escape admits without charging, on the premise that a
+   * parent whose virtual time is a round behind the wall clock has real spare
+   * capacity. That premise only holds for the root.
+   *
+   * A non-root tier's virtual time also lags while the tier itself is blocked
+   * against the tier above - it is not sending, so its clock is not advancing
+   * - and that is congestion, not spare capacity. Measured: with an S-VLAN
+   * throttled by its port, every one of its children read the lag as an
+   * escape, admitted uncharged, and the intra-S-VLAN deficits stopped moving
+   * altogether, so walk order decided everything and two of four children got
+   * nothing at all in 30 s.
+   *
+   * Taking the latest virtual time in the chain means the escape fires only
+   * when every tier is genuinely idle. */
+  if (agg->parent_index != ~0)
+    {
+      cake_aggregate_t *parent =
+	pool_elt_at_index (cm->aggregates, agg->parent_index);
+      u64 parent_vt =
+	__atomic_load_n (&parent->global_shaper_time_ns, __ATOMIC_RELAXED);
+
+      if (parent_vt > idle_vt)
+	idle_vt = parent_vt;
+    }
+
+  return cake_drr_local_admit (&cs->drr, round_bytes, &agg->active_weight,
+			       &idle_vt, now_ns);
+}
+
+/* Move a child's weight into or out of an aggregate, propagating the
+ * transition upward as a refcount: an aggregate counts toward its own parent's
+ * W exactly while it has at least one active child, so only the caller that
+ * observes the 0->1 (join) or 1->0 (leave) transition carries it up. Taking
+ * the aggregate index as an argument is what lets a reparent detach from the
+ * old parent and attach to the new one while the child stays active. */
+static_always_inline void
+cake_agg_weight_add (cake_main_t *cm, u32 agg_index, u64 weight)
+{
+  cake_aggregate_t *agg;
+
+  if (agg_index == ~0)
+    return;
+
+  agg = pool_elt_at_index (cm->aggregates, agg_index);
+
+  if (cake_drr_parent_join (&agg->active_weight, &agg->n_active_children,
+			    weight) == 0 &&
+      agg->parent_index != ~0)
+    {
+      cake_aggregate_t *parent =
+	pool_elt_at_index (cm->aggregates, agg->parent_index);
+      cake_drr_parent_join (&parent->active_weight,
+			    &parent->n_active_children,
+			    agg->drr.effective_weight);
+    }
+}
+
+static_always_inline void
+cake_agg_weight_sub (cake_main_t *cm, u32 agg_index, u64 weight)
+{
+  cake_aggregate_t *agg;
+
+  if (agg_index == ~0)
+    return;
+
+  agg = pool_elt_at_index (cm->aggregates, agg_index);
+
+  if (cake_drr_parent_leave (&agg->active_weight, &agg->n_active_children,
+			     weight) == 1 &&
+      agg->parent_index != ~0)
+    {
+      cake_aggregate_t *parent =
+	pool_elt_at_index (cm->aggregates, agg->parent_index);
+      cake_drr_parent_leave (&parent->active_weight,
+			     &parent->n_active_children,
+			     agg->drr.effective_weight);
+    }
+}
+
+/* Weight accounting, at exactly three sites: activation on enqueue,
+ * empty-detect deactivation on dequeue, and teardown. Both directions are
+ * guarded by the child's own flag, which is owner-thread-local; only the
+ * parent's counters are atomic, and they move on activation transitions
+ * rather than per packet.
+ *
+ * The defensive deactivations in the dequeue walk - pool-free and
+ * owner-mismatch - must NOT call this. They clear the activity bit for a
+ * scheduler whose teardown already ran, and subtracting there double-counts:
+ * active_weight underflows and every sibling's quantum collapses. */
+static_always_inline void
+cake_sched_drr_activate (cake_main_t *cm, cake_sched_t *cs)
+{
+  if (PREDICT_TRUE (cs->drr.active))
+    return;
+
+  if (!cake_drr_child_activate (&cs->drr))
+    return;
+
+  cake_agg_weight_add (cm, cs->aggregate_index, cs->drr.effective_weight);
+}
+
+static_always_inline void
+cake_sched_drr_deactivate (cake_main_t *cm, cake_sched_t *cs)
+{
+  if (!cake_drr_child_deactivate (&cs->drr))
+    return;
+
+  cake_agg_weight_sub (cm, cs->aggregate_index, cs->drr.effective_weight);
+}
+
+/* The parent chain's gates, in deliberate order: the commonest rejection
+ * under saturation - the immediate parent sitting at its own configured rate
+ * - fails first and unwinds nothing. A DRR block against the tier above
+ * unwinds one gate charge. Only the rare port rejection unwinds two things,
+ * and S-VLANs are normally provisioned under port rate so the port rarely
+ * refuses what the S-VLAN accepted. */
+typedef enum
+{
+  CAKE_PARENT_OK = 0,
+  CAKE_PARENT_GATE_CLOSED,
+  CAKE_PARENT_DRR_BLOCKED,
+} cake_parent_result_t;
+
+static_always_inline cake_parent_result_t
 cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
 			u64 now_ns, u32 thread_index)
 {
+  cake_aggregate_t *agg, *parent;
+  cake_agg_stats_t *st;
+  u64 cost_ns;
+  cake_drr_admit_t reserved;
+
   if (cs->aggregate_index == ~0)
-    return 1;
+    return CAKE_PARENT_OK;
 
-  cake_aggregate_t *agg =
-    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-  u64 cost_ns = cake_cost_ns (adj_len, agg->rate_ns_per_byte_scaled);
-  u64 old_time, base, new_time;
+  agg = pool_elt_at_index (cm->aggregates, cs->aggregate_index);
+  cost_ns = cake_cost_ns (adj_len, agg->rate_ns_per_byte_scaled);
 
-  do
+  /* The immediate parent's rate gate. */
+  if (!cake_shaper_gate_take (&agg->global_shaper_time_ns, cost_ns, now_ns,
+			      agg->burst_ns))
     {
-      old_time =
-	__atomic_load_n (&agg->global_shaper_time_ns, __ATOMIC_ACQUIRE);
-
-      if (old_time > now_ns)
-	return 0;
-
-      /* old_time stays as loaded: it is the CAS expected value, so clamping it
-       * would guarantee the exchange never succeeds. */
-      base = old_time;
-      if (now_ns - base > CAKE_AGG_BURST_NS)
-	base = now_ns - CAKE_AGG_BURST_NS;
-
-      new_time = base + cost_ns;
+      vec_elt_at_index (agg->stats, thread_index)->parent_blocked++;
+      return CAKE_PARENT_GATE_CLOSED;
     }
-  while (!__atomic_compare_exchange_n (&agg->global_shaper_time_ns, &old_time,
-					new_time, 1, __ATOMIC_ACQ_REL,
-					__ATOMIC_ACQUIRE));
 
-  cake_agg_stats_t *st = vec_elt_at_index (agg->stats, thread_index);
+  st = vec_elt_at_index (agg->stats, thread_index);
   st->shaped_pkts++;
   st->shaped_bytes += adj_len;
 
-  return 1;
+  if (agg->parent_index == ~0)
+    return CAKE_PARENT_OK;
+
+  parent = pool_elt_at_index (cm->aggregates, agg->parent_index);
+
+  /* This aggregate's own share of the tier above, one CAS. */
+  reserved =
+    cake_drr_shared_reserve (&agg->drr, parent->drr_round_bytes,
+			     &parent->active_weight,
+			     &parent->global_shaper_time_ns, adj_len, now_ns);
+
+  if (reserved == CAKE_DRR_BLOCKED)
+    {
+      __atomic_fetch_sub (&agg->global_shaper_time_ns, cost_ns,
+			  __ATOMIC_RELAXED);
+      st->shaped_pkts--;
+      st->shaped_bytes -= adj_len;
+      st->drr_blocked++;
+      return CAKE_PARENT_DRR_BLOCKED;
+    }
+
+  /* The tier above's rate gate. */
+  if (!cake_shaper_gate_take (&parent->global_shaper_time_ns,
+			      cake_cost_ns (adj_len,
+					    parent->rate_ns_per_byte_scaled),
+			      now_ns, parent->burst_ns))
+    {
+      /* Escapes charge inside the CAS and refund like any other admission;
+       * the test only guards a future CAKE_DRR_UNARBITRATED return, which
+       * must never be given credit back. */
+      if (reserved == CAKE_DRR_ADMIT)
+	cake_drr_shared_refund (&agg->drr, adj_len);
+
+      __atomic_fetch_sub (&agg->global_shaper_time_ns, cost_ns,
+			  __ATOMIC_RELAXED);
+      st->shaped_pkts--;
+      st->shaped_bytes -= adj_len;
+      vec_elt_at_index (parent->stats, thread_index)->parent_blocked++;
+      return CAKE_PARENT_GATE_CLOSED;
+    }
+
+  st = vec_elt_at_index (parent->stats, thread_index);
+  st->shaped_pkts++;
+  st->shaped_bytes += adj_len;
+
+  return CAKE_PARENT_OK;
 }
 
 static_always_inline void
 cake_agg_stats_sum (cake_aggregate_t *agg, u64 *shaped_pkts, u64 *shaped_bytes,
-		    u64 *backpressure_events)
+		    u64 *backpressure_events, u64 *drr_blocked,
+		    u64 *parent_blocked)
 {
   *shaped_pkts = *shaped_bytes = *backpressure_events = 0;
+  *drr_blocked = *parent_blocked = 0;
 
   cake_agg_stats_t *st;
   vec_foreach (st, agg->stats)
@@ -795,6 +1138,8 @@ cake_agg_stats_sum (cake_aggregate_t *agg, u64 *shaped_pkts, u64 *shaped_bytes,
       *shaped_pkts += st->shaped_pkts;
       *shaped_bytes += st->shaped_bytes;
       *backpressure_events += st->backpressure_events;
+      *drr_blocked += st->drr_blocked;
+      *parent_blocked += st->parent_blocked;
     }
 }
 

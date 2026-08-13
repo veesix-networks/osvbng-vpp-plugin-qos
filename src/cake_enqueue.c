@@ -105,6 +105,7 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 
   u32 n_enqueued = 0;
   u32 n_dropped = 0;
+  u32 n_agg_backpressure = 0;
 
   vlib_buffer_t *bufs[VLIB_FRAME_SIZE], **b = bufs;
   vlib_get_buffers (vm, from, bufs, n_left);
@@ -255,27 +256,16 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  continue;
 	}
 
-      if (cs->aggregate_index != ~0)
+      if (PREDICT_FALSE (!cake_agg_admit_chain (cm, cs, pkt_len, thread_index)))
 	{
-	  cake_aggregate_t *agg =
-	    pool_elt_at_index (cm->aggregates, cs->aggregate_index);
-	  /* Load-compare-add would let every worker admit against the same
-	   * under-limit read, overshooting by one packet per worker. */
-	  u32 prev =
-	    __atomic_fetch_add (&agg->buffer_usage, pkt_len, __ATOMIC_RELAXED);
-	  if (PREDICT_FALSE (prev + pkt_len > agg->buffer_limit))
-	    {
-	      __atomic_fetch_sub (&agg->buffer_usage, pkt_len,
-				  __ATOMIC_RELAXED);
-	      cobalt_queue_full (flow, cs->target_us, cs->p_inc,
-				 (u32) (vlib_time_now (vm) * 1e6));
-	      vlib_buffer_free_one (vm, bi0);
-	      cs->dropped_pkts++;
-	      tin->drops++;
-	      n_dropped++;
-	      vec_elt_at_index (agg->stats, thread_index)->backpressure_events++;
-	      continue;
-	    }
+	  cobalt_queue_full (flow, cs->target_us, cs->p_inc,
+			     (u32) (vlib_time_now (vm) * 1e6));
+	  vlib_buffer_free_one (vm, bi0);
+	  cs->dropped_pkts++;
+	  tin->drops++;
+	  n_dropped++;
+	  n_agg_backpressure++;
+	  continue;
 	}
 
       if (PREDICT_FALSE (flow->flow_state == CAKE_FLOW_NONE))
@@ -347,6 +337,12 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    tin->hosts[flow->dst_host_idx].bulk_flow_count++;
 	}
 
+      /* 0->1 active: this scheduler now competes for its parent's rate, so
+       * its weight joins the parent's active sum. Idempotent - the common
+       * case is an already-active scheduler and returns without touching the
+       * parent. */
+      cake_sched_drr_activate (cm, cs);
+
       if (!clib_bitmap_get (cm->per_thread[thread_index].active_bitmap,
 			    cs->sched_index))
 	{
@@ -388,6 +384,10 @@ cake_enqueue_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			       n_enqueued);
   vlib_node_increment_counter (vm, node->node_index,
 			       CAKE_ERROR_DROPPED_OVERFLOW, n_dropped);
+  if (n_agg_backpressure)
+    vlib_node_increment_counter (vm, node->node_index,
+				 CAKE_ERROR_AGG_BACKPRESSURE,
+				 n_agg_backpressure);
 
   return frame->n_vectors;
 }
