@@ -37,10 +37,11 @@ vl_api_osvbng_cake_sched_enable_disable_t_handler (
   u32 interval_us = ntohl (mp->interval_us);
   u32 flags = ntohl (mp->flags);
 
+  /* v1 carries no weight, so the child's share is its rate alone. */
   rv = cake_sched_enable_disable (cm->vlib_main, sw_if_index, mp->is_enable,
 				  rate_bytes_per_sec, tin_mode,
 				  overhead_bytes, atm_mode, mpu, buffer_limit,
-				  target_us, interval_us, flags);
+				  target_us, interval_us, flags, 0);
 
   REPLY_MACRO (VL_API_OSVBNG_CAKE_SCHED_ENABLE_DISABLE_REPLY);
 }
@@ -122,9 +123,10 @@ vl_api_osvbng_cake_aggregate_create_t_handler (
   vl_api_osvbng_cake_aggregate_create_reply_t *rmp;
   int rv = 0;
 
+  /* v1 carries neither weight nor burst; both take their defaults. */
   rv = cake_aggregate_create (cm->vlib_main, ntohl (mp->sw_if_index),
-			       clib_net_to_host_u64 (mp->rate_bytes_per_sec),
-			       ntohl (mp->buffer_limit));
+			       clib_net_to_host_u64 (mp->rate_bytes_per_sec), 0,
+			       0, ntohl (mp->buffer_limit));
 
   REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_CREATE_REPLY);
 }
@@ -159,8 +161,12 @@ send_cake_aggregate_details (cake_aggregate_t *agg,
   rmp->rate_bytes_per_sec = clib_host_to_net_u64 (agg->rate_bytes_per_sec);
   rmp->buffer_usage = ntohl (agg->buffer_usage);
   rmp->buffer_limit = ntohl (agg->buffer_limit);
+  /* The v1 message has no field for the gate-side counters; they reach an
+   * operator through the CLI until the _v2 messages land. */
   u64 shaped_pkts, shaped_bytes, backpressure_events;
-  cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes, &backpressure_events);
+  u64 drr_blocked, parent_blocked;
+  cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes, &backpressure_events,
+		      &drr_blocked, &parent_blocked);
 
   rmp->shaped_pkts = clib_host_to_net_u64 (shaped_pkts);
   rmp->shaped_bytes = clib_host_to_net_u64 (shaped_bytes);
@@ -189,6 +195,192 @@ vl_api_osvbng_cake_aggregate_dump_t_handler (
 	continue;
       send_cake_aggregate_details (agg, reg, mp->context);
     }
+}
+
+
+static void
+vl_api_osvbng_cake_sched_v2_enable_disable_t_handler (
+  vl_api_osvbng_cake_sched_v2_enable_disable_t *mp)
+{
+  cake_main_t *cm = &cake_main;
+  vl_api_osvbng_cake_sched_v2_enable_disable_reply_t *rmp;
+  int rv;
+
+  VALIDATE_SW_IF_INDEX (mp);
+
+  rv = cake_sched_enable_disable (
+    cm->vlib_main, ntohl (mp->sw_if_index), mp->is_enable,
+    clib_net_to_host_u64 (mp->rate_bytes_per_sec), mp->tin_mode,
+    (i16) ntohs (mp->overhead_bytes), mp->atm_mode, mp->mpu,
+    ntohl (mp->buffer_limit), ntohl (mp->target_us), ntohl (mp->interval_us),
+    ntohl (mp->flags), ntohl (mp->weight));
+
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_SCHED_V2_ENABLE_DISABLE_REPLY);
+}
+
+static void
+vl_api_osvbng_cake_aggregate_v2_create_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_create_t *mp)
+{
+  cake_main_t *cm = &cake_main;
+  vl_api_osvbng_cake_aggregate_v2_create_reply_t *rmp;
+  int rv;
+
+  VALIDATE_SW_IF_INDEX (mp);
+
+  /* An unknown level must not fall through to the port path. */
+  if (mp->level == OSVBNG_CAKE_AGG_LEVEL_SVLAN)
+    rv = cake_svlan_aggregate_create (
+      cm->vlib_main, ntohl (mp->sw_if_index), ntohs (mp->svlan_id),
+      ntohs (mp->svlan_id_end), clib_net_to_host_u64 (mp->rate_bytes_per_sec),
+      ntohl (mp->weight), ntohl (mp->burst_ns), ntohl (mp->buffer_limit));
+  else if (mp->level == OSVBNG_CAKE_AGG_LEVEL_PORT)
+    rv = cake_aggregate_create (
+      cm->vlib_main, ntohl (mp->sw_if_index),
+      clib_net_to_host_u64 (mp->rate_bytes_per_sec), ntohl (mp->weight),
+      ntohl (mp->burst_ns), ntohl (mp->buffer_limit));
+  else
+    rv = VNET_API_ERROR_INVALID_VALUE;
+
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_CREATE_REPLY);
+}
+
+static void
+vl_api_osvbng_cake_aggregate_v2_delete_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_delete_t *mp)
+{
+  cake_main_t *cm = &cake_main;
+  vl_api_osvbng_cake_aggregate_v2_delete_reply_t *rmp;
+  int rv;
+
+  VALIDATE_SW_IF_INDEX (mp);
+
+  if (mp->level == OSVBNG_CAKE_AGG_LEVEL_SVLAN)
+    rv = cake_svlan_aggregate_delete (cm->vlib_main, ntohl (mp->sw_if_index),
+				      ntohs (mp->svlan_id));
+  else if (mp->level == OSVBNG_CAKE_AGG_LEVEL_PORT)
+    rv = cake_aggregate_delete (cm->vlib_main, ntohl (mp->sw_if_index));
+  else
+    rv = VNET_API_ERROR_INVALID_VALUE;
+
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_DELETE_REPLY);
+}
+
+static void
+vl_api_osvbng_cake_aggregate_v2_update_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_update_t *mp)
+{
+  cake_main_t *cm = &cake_main;
+  vl_api_osvbng_cake_aggregate_v2_update_reply_t *rmp;
+  int rv;
+
+  VALIDATE_SW_IF_INDEX (mp);
+
+  if (mp->level == OSVBNG_CAKE_AGG_LEVEL_PORT ||
+      mp->level == OSVBNG_CAKE_AGG_LEVEL_SVLAN)
+    rv = cake_aggregate_update (cm->vlib_main, ntohl (mp->sw_if_index),
+				mp->level, ntohs (mp->svlan_id),
+				clib_net_to_host_u64 (mp->rate_bytes_per_sec),
+				ntohl (mp->weight), ntohl (mp->burst_ns),
+				ntohl (mp->buffer_limit));
+  else
+    rv = VNET_API_ERROR_INVALID_VALUE;
+
+  BAD_SW_IF_INDEX_LABEL;
+  REPLY_MACRO (VL_API_OSVBNG_CAKE_AGGREGATE_V2_UPDATE_REPLY);
+}
+
+static void
+send_cake_aggregate_v2_details (cake_main_t *cm, cake_aggregate_t *agg,
+				vl_api_registration_t *reg, u32 context)
+{
+  vl_api_osvbng_cake_aggregate_v2_details_t *rmp;
+  u64 shaped_pkts, shaped_bytes, backpressure, drr_blocked, parent_blocked;
+
+  rmp = vl_msg_api_alloc (sizeof (*rmp));
+  clib_memset (rmp, 0, sizeof (*rmp));
+
+  rmp->_vl_msg_id =
+    ntohs (VL_API_OSVBNG_CAKE_AGGREGATE_V2_DETAILS + cm->msg_id_base);
+  rmp->context = context;
+  rmp->sw_if_index = ntohl (agg->sw_if_index);
+  rmp->level = agg->level;
+  rmp->parent_sw_if_index =
+    agg->parent_index == ~0
+      ? ~0
+      : ntohl (pool_elt_at_index (cm->aggregates, agg->parent_index)
+		 ->sw_if_index);
+  rmp->svlan_id = ntohs (agg->svlan_id);
+  rmp->svlan_id_end = ntohs (agg->svlan_id_end);
+  rmp->rate_bytes_per_sec = clib_host_to_net_u64 (agg->rate_bytes_per_sec);
+  rmp->weight = ntohl (agg->weight);
+  rmp->burst_ns = ntohl (agg->burst_ns);
+  rmp->buffer_usage = ntohl (agg->buffer_usage);
+  rmp->buffer_limit = ntohl (agg->buffer_limit);
+  rmp->effective_weight =
+    clib_host_to_net_u64 (agg->drr.effective_weight);
+  rmp->active_weight = clib_host_to_net_u64 (
+    __atomic_load_n (&agg->active_weight, __ATOMIC_RELAXED));
+  rmp->n_active_children =
+    ntohl (__atomic_load_n (&agg->n_active_children, __ATOMIC_RELAXED));
+
+  cake_agg_stats_sum (agg, &shaped_pkts, &shaped_bytes, &backpressure,
+		      &drr_blocked, &parent_blocked);
+  rmp->shaped_pkts = clib_host_to_net_u64 (shaped_pkts);
+  rmp->shaped_bytes = clib_host_to_net_u64 (shaped_bytes);
+  rmp->backpressure_events = clib_host_to_net_u64 (backpressure);
+  rmp->drr_blocked = clib_host_to_net_u64 (drr_blocked);
+  rmp->parent_blocked = clib_host_to_net_u64 (parent_blocked);
+
+  vl_api_send_msg (reg, (u8 *) rmp);
+}
+
+static void
+vl_api_osvbng_cake_aggregate_v2_dump_t_handler (
+  vl_api_osvbng_cake_aggregate_v2_dump_t *mp)
+{
+  cake_main_t *cm = &cake_main;
+  vl_api_registration_t *reg;
+  cake_aggregate_t *agg;
+  u32 sw_if_index = ntohl (mp->sw_if_index);
+
+  reg = vl_api_client_index_to_registration (mp->client_index);
+  if (!reg)
+    return;
+
+  /* A port and its S-VLANs both report against the port's sw_if_index, so a
+   * filtered dump has to compare the whole chain, not just this entry. */
+  pool_foreach (agg, cm->aggregates)
+    {
+      if (sw_if_index != ~0 && agg->sw_if_index != sw_if_index)
+	continue;
+      send_cake_aggregate_v2_details (cm, agg, reg, mp->context);
+    }
+}
+
+static void
+vl_api_osvbng_cake_capabilities_t_handler (
+  vl_api_osvbng_cake_capabilities_t *mp)
+{
+  cake_main_t *cm = &cake_main;
+  vl_api_osvbng_cake_capabilities_reply_t *rmp;
+  int rv = 0;
+
+  REPLY_MACRO2 (
+    VL_API_OSVBNG_CAKE_CAPABILITIES_REPLY, ({
+      rmp->version = ntohl (3);
+      rmp->max_levels = 2;
+      rmp->max_svlan_id = ntohl (CAKE_SVLAN_MAX - 1);
+      rmp->weight_min = ntohl (CAKE_WEIGHT_MIN);
+      rmp->weight_max = ntohl (CAKE_WEIGHT_MAX);
+      rmp->features = ntohl (OSVBNG_CAKE_FEATURE_SVLAN_TIER |
+			     OSVBNG_CAKE_FEATURE_WEIGHTED_DRR |
+			     OSVBNG_CAKE_FEATURE_AGG_BURST |
+			     OSVBNG_CAKE_FEATURE_AGG_UPDATE);
+    }));
 }
 
 #include <osvbng_qos_sched/osvbng_qos_sched.api.c>
