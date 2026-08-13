@@ -99,6 +99,46 @@ declaration the resolver cannot express), both fixed on the branch.
 
 Still unrun: everything multi-worker.
 
+### Open, not ours: VPP crashes under PPPoE session churn
+
+Suites 51 and 52 gained a churn phase (bngblaster's monkey) to exercise
+scheduler create/teardown repeatedly. Suite 52 crashes the dataplane:
+
+```
+received signal SIGSEGV, PC ..., faulting address ...
+#0  interface_drop_fn_x86_64_v3 + 0xa18   from libvnet.so.26.06
+```
+
+Reproducible - three of three PPPoE churn runs. What the evidence rules
+in and out:
+
+| | result |
+|---|---|
+| PPPoE churn, full HQoS config | crashed 3/3 |
+| **PPPoE churn, all QoS stripped** (`config/bng1/osvbng-noqos.yaml`) | **crashed** - no aggregates, no schedulers, port shaped 0 bytes |
+| IPoE churn (suite 51) | no crash in 3 runs |
+| Sub-interface churn under saturation, no control plane (`tests/churn-rig.sh`) | no crash in 150 deletions |
+
+The no-QoS run is decisive: with nothing programmed the enqueue feature is
+not enabled on any interface, so the plugin never sees a packet, and the
+dataplane still dies the same way. **The crash is not in this spec's code**,
+and IPoE surviving while PPPoE fails every time points at the PPPoE session
+teardown path.
+
+Not isolated yet: the af_packet TPID patch is in the image for every one of
+these runs and cannot be removed without breaking dot1ad session bring-up.
+Running an existing dot1q PPPoE suite (04) with the monkey enabled would
+settle whether it is implicated. After that, a debug VPP build in the
+osvbng image is the next step - `interface_drop_fn` indexes a per-interface
+counter by the buffer's sw_if_index, so the fault is a buffer reaching it
+with a stale or garbage index, and only assertions will catch that at the
+point it happens rather than three nodes later.
+
+Consequence for this spec: suite 52 cannot pass until that is fixed. Suite
+51 passes except for an unrelated flake where some IPoE sessions do not
+re-establish after an ungraceful kill (`max_concurrent_sessions: 1` against
+a session the BNG still holds is the untested suspect).
+
 ## Review inventory
 
 | artifact | lens | reviewer | findings |
