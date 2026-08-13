@@ -50,6 +50,10 @@
 #define CAKE_INTERVAL_US_DEFAULT  100000
 #define CAKE_REC_INV_SQRT_CACHE	  16
 
+/* Idle credit ceiling for an aggregate shaper. 25 ms sits inside the
+ * 10-125 ms range commodity shapers use. */
+#define CAKE_AGG_BURST_NS	  (25ULL * 1000000ULL)
+
 #define CAKE_HOSTS	  256
 #define CAKE_HOSTS_MASK	  (CAKE_HOSTS - 1)
 
@@ -709,20 +713,23 @@ cake_agg_dequeue_gate (cake_main_t *cm, cake_sched_t *cs, u32 adj_len,
   cake_aggregate_t *agg =
     pool_elt_at_index (cm->aggregates, cs->aggregate_index);
   u64 cost_ns = (u64) adj_len * agg->rate_ns_per_byte;
-  u64 old_time, new_time;
+  u64 old_time, base, new_time;
 
   do
     {
       old_time =
 	__atomic_load_n (&agg->global_shaper_time_ns, __ATOMIC_ACQUIRE);
 
-      if (old_time < now_ns)
-	old_time = now_ns;
-
       if (old_time > now_ns)
 	return 0;
 
-      new_time = old_time + cost_ns;
+      /* old_time stays as loaded: it is the CAS expected value, so clamping it
+       * would guarantee the exchange never succeeds. */
+      base = old_time;
+      if (now_ns - base > CAKE_AGG_BURST_NS)
+	base = now_ns - CAKE_AGG_BURST_NS;
+
+      new_time = base + cost_ns;
     }
   while (!__atomic_compare_exchange_n (&agg->global_shaper_time_ns, &old_time,
 					new_time, 1, __ATOMIC_ACQ_REL,
