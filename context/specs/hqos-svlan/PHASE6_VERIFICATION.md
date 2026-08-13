@@ -116,23 +116,34 @@ in and out:
 |---|---|
 | PPPoE churn, full HQoS config | crashed 3/3 |
 | **PPPoE churn, all QoS stripped** (`config/bng1/osvbng-noqos.yaml`) | **crashed** - no aggregates, no schedulers, port shaped 0 bytes |
+| **PPPoE churn, no QoS and no 802.1ad** (`osvbng-noqos-dot1q.yaml` + `config-dot1q.json`) | **crashed** |
 | IPoE churn (suite 51) | no crash in 3 runs |
 | Sub-interface churn under saturation, no control plane (`tests/churn-rig.sh`) | no crash in 150 deletions |
 
-The no-QoS run is decisive: with nothing programmed the enqueue feature is
-not enabled on any interface, so the plugin never sees a packet, and the
-dataplane still dies the same way. **The crash is not in this spec's code**,
-and IPoE surviving while PPPoE fails every time points at the PPPoE session
-teardown path.
+Fully isolated. The no-QoS run removes this spec's code - with nothing
+programmed the enqueue feature is not enabled on any interface, so the
+plugin never sees a packet - and the dot1q run removes 802.1ad and with it
+any effect of the af_packet TPID patch, which only rewrites the
+reconstructed ethertype when the kernel reports a TPID other than 0x8100.
+What remains is PPPoE session churn under traffic, and IPoE churning the
+same way does not crash.
 
-Not isolated yet: the af_packet TPID patch is in the image for every one of
-these runs and cannot be removed without breaking dot1ad session bring-up.
-Running an existing dot1q PPPoE suite (04) with the monkey enabled would
-settle whether it is implicated. After that, a debug VPP build in the
-osvbng image is the next step - `interface_drop_fn` indexes a per-interface
-counter by the buffer's sw_if_index, so the fault is a buffer reaching it
-with a stale or garbage index, and only assertions will catch that at the
-point it happens rather than three nodes later.
+**Leading hypothesis, not proven.** `osvbng_pppoe.c` creates each session's
+midchain adjacency (`adj_nbr_midchain_update_rewrite`,
+`adj_nbr_midchain_stack`, around :234-265) but the delete path (:490-520)
+never unstacks or releases it: the session interface is not deleted at all,
+it is set down, hidden, unparented and parked on
+`free_pppoe_session_hw_if_indices` for reuse, then the FIB path is removed
+and the pool entry freed. An adjacency left stacked on a DPO that is being
+torn down, with traffic still following it, is the standard way a buffer
+acquires garbage metadata - and `interface_drop_fn` crashes indexing a
+per-interface counter by the buffer's sw_if_index, which is what a garbage
+buffer produces. A debug VPP build with assertions would confirm it at the
+point of corruption rather than three nodes later.
+
+That the interface is recycled rather than deleted also explains why the
+dataplane's interface-delete hook never cleaned up PPPoE schedulers, which
+is what the teardown check caught before the IfIndex fix.
 
 Consequence for this spec: suite 52 cannot pass until that is fixed. Suite
 51 passes except for an unrelated flake where some IPoE sessions do not
