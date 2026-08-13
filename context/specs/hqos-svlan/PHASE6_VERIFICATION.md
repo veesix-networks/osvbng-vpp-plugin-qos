@@ -147,48 +147,58 @@ Isolated to an unmerged dependency. The no-QoS run removes this spec's
 code - with nothing programmed the enqueue feature is not enabled on any
 interface, so the plugin never sees a packet - and the dot1q run removes
 802.1ad and with it any effect of the af_packet TPID patch. What remained
-was the PPPoE plugin itself, and swapping only that `.so` settles it:
+was the PPPoE plugin itself, and swapping only that `.so` appeared to
+settle it:
 
 | PPPoE plugin | runs | result |
 |---|---|---|
 | `fix/session-sup-sw-if-index` (pppoe-control #3) | 4 | SIGSEGV every time |
 | shipped | 1 | no crash, churn completed, teardown clean |
 
-**The crash belongs to the session parentage PR this spec depends on**, not
-to shipped osvbng and not to the QoS plugin. That branch points a session
-interface's `sup_sw_if_index` at its encap sub-interface, on an interface
-created by `vnet_register_interface()` and therefore of type
-`VNET_SW_INTERFACE_TYPE_HARDWARE`, where VPP's convention is
-`sup_sw_if_index == sw_if_index`; `vnet_get_sup_sw_interface()` only
-follows the field for SUB, P2P and PIPE. The PPPoE plugin also recycles
-session interfaces through a free list rather than deleting them, so a
-reused interface is re-parented over whatever the previous parenting left.
-The IPoE equivalent (ipoe #7) does not crash under the same churn and does
-not recycle interfaces the same way.
+**Root cause found 2026-08-13, and the plugin-swap table above was
+misleading.** A full sweep of VPP v26.06 for readers of
+`sup_sw_if_index` found every one either type-gated (`vnet_get_sup_sw_-
+interface` and the set-flags helper ignore the field for HARDWARE-type
+interfaces) or null-guarded (linux-cp bails for pairless interfaces) -
+no concrete crash path from the parenting commit at all. The single
+clean stock-plugin run was one run of a timing-dependent flake, and the
+stock `.so` also predated three unrelated RX-path commits, so the swap
+discriminated builds, not the parenting change.
 
-Consequence for this spec: attaching a scheduler to an S-VLAN through a
-*session* interface depends on those PRs, so pppoe-control #3 has to be
-fixed before HQoS over PPPoE sessions can ship. Nothing here needs to
-change. Filed upstream as veesix-networks/osvbng#419.
+The actual defect is in the punt plugin's egress inject
+(`osvbng-vpp/plugins/osvbng_punt/osvbng_punt_egress.c`): every
+control-plane-injected frame was built with `sw_if_index[VLIB_RX] = ~0`,
+and `interface_drop_punt` (`vnet/interface_output.c`) indexes the
+per-interface drop counter by RX with no validity check -
+`counters[0xFFFFFFFF]` is a wild write. The reachable drop is exactly
+churn-shaped: PPP in-session control (LCP Terminate-Ack, Echo-Reply)
+injects through the *session* interface, the racing async session
+delete downs and hides that interface first, and interface-output
+drops the frame as interface-down. Every observable matches: main
+thread (the egress node polls on main), per-run varying fault address
+(wild index into the heap), IPoE immune (its control traffic injects
+through the always-up S-VLAN sub-interface), QoS- and
+802.1ad-independent. Fixed in osvbng-vpp `a3972ec`: injected frames
+carry RX = TX so any drop indexes a real counter, and injection into a
+down or hidden interface is skipped outright.
 
-**Secondary observation for whoever fixes it.** `osvbng_pppoe.c` creates each session's
-midchain adjacency (`adj_nbr_midchain_update_rewrite`,
-`adj_nbr_midchain_stack`, around :234-265) but the delete path (:490-520)
-never unstacks or releases it: the session interface is not deleted at all,
-it is set down, hidden, unparented and parked on
-`free_pppoe_session_hw_if_indices` for reuse, then the FIB path is removed
-and the pool entry freed. An adjacency left stacked on a DPO that is being
-torn down, with traffic still following it, is the standard way a buffer
-acquires garbage metadata - and `interface_drop_fn` crashes indexing a
-per-interface counter by the buffer's sw_if_index, which is what a garbage
-buffer produces. A debug VPP build with assertions would confirm it at the
-point of corruption rather than three nodes later.
+The audit also hardened the PPPoE plugin (pppoe-control `fd12dbb`,
+neither defect crash-attributed but both real): `pppoe_update_adj`
+dereferenced `session_index_by_sw_if_index` with no `~0`/bounds guard -
+a wild `pool_elt_at_index` for any adjacency re-resolve against a
+parked interface - and the session delete path dismantled the interface
+before stopping decap/FIB resolution; it now tears down in resolution →
+forwarding → interface → pool order. Verified in the builder: 50
+create/delete/recycle cycles with scheduler attach/detach per cycle,
+clean.
 
-That the interface is recycled rather than deleted also explains why the
-dataplane's interface-delete hook never cleaned up PPPoE schedulers, which
-is what the teardown check caught before the IfIndex fix.
+The parenting commit itself stands exonerated pending lab
+revalidation. That the interface is recycled rather than deleted also
+explains why the dataplane's interface-delete hook never cleaned up
+PPPoE schedulers - which is what the teardown check caught before the
+IfIndex fix, and what the hidden-interface disable fix above closes.
 
-Consequence for this spec: suite 52 cannot pass until that is fixed.
+Filed upstream as veesix-networks/osvbng#419.
 
 ### Open, not ours: IPoE sessions do not always come back from an ungraceful kill
 
