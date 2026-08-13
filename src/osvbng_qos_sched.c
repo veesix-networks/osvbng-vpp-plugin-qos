@@ -459,7 +459,13 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 {
   cake_main_t *cm = &cake_main;
 
-  if (!vnet_sw_interface_is_api_valid (vnet_get_main (), sw_if_index))
+  /* Disable must accept a hidden interface: PPPoE parks session
+   * interfaces hidden for reuse instead of deleting them, and the
+   * teardown disable races that hiding. Rejecting it leaks the
+   * scheduler onto the recycled interface's next subscriber. */
+  if (is_enable ?
+	!vnet_sw_interface_is_api_valid (vnet_get_main (), sw_if_index) :
+	!vnet_sw_interface_is_valid (vnet_get_main (), sw_if_index))
     return VNET_API_ERROR_INVALID_SW_IF_INDEX;
 
   if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
@@ -580,8 +586,8 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
     }
   else
     {
-      vec_validate_init_empty (cm->sched_index_by_sw_if_index, sw_if_index,
-			       ~0);
+      if (sw_if_index >= vec_len (cm->sched_index_by_sw_if_index))
+	return VNET_API_ERROR_NO_SUCH_ENTRY;
       u32 pool_index = cm->sched_index_by_sw_if_index[sw_if_index];
       if (pool_index == ~0)
 	return VNET_API_ERROR_NO_SUCH_ENTRY;
