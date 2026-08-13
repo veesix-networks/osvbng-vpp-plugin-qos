@@ -99,6 +99,27 @@ declaration the resolver cannot express), both fixed on the branch.
 
 Still unrun: everything multi-worker.
 
+**Ours after all: schedulers leaked on hidden PPPoE interfaces (fixed,
+645a3ad).** With churn removed, suite 52's drain check still flapped —
+some runs left two schedulers alive with their S-VLAN aggregates holding
+weight, and the log showed no disable attempt and no error for exactly
+those two. The trail: the sessions API emptied (so every Released event
+was fully processed), which leaves only the silent exits — and the
+silent exit taken was `RemoveScheduler`'s -2-means-already-gone path.
+PPPoE deletes a session by *hiding* and parking its interface for reuse,
+so the interface-delete hook never fires, and the control-plane disable
+races the VPP session delete: delete first → the plugin's
+`vnet_sw_interface_is_api_valid` guard rejects the disable with -2 → the
+control plane logs "already removed with its interface" at debug. True
+for IPoE, where the interface really is deleted; false for PPPoE. Worse,
+the survivor makes the recycled interface's next subscriber inherit the
+old rate (enable returns ENTRY_ALREADY_EXISTS, absorbed by replay
+tolerance). Fix: disable now requires only that the interface exist;
+enable still requires api-visibility. `tests/hidden-if-rig.sh`
+reproduces it end to end — the disable must go through the binary API by
+sw_if_index because the CLI cannot even name a hidden interface — and
+discriminates pre-fix (-2, leak) from fixed (0, drained).
+
 ### Open, not ours: VPP crashes under PPPoE session churn
 
 Suites 51 and 52 gained a churn phase (bngblaster's monkey) to exercise
