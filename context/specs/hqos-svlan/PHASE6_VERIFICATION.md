@@ -120,15 +120,35 @@ in and out:
 | IPoE churn (suite 51) | no crash in 3 runs |
 | Sub-interface churn under saturation, no control plane (`tests/churn-rig.sh`) | no crash in 150 deletions |
 
-Fully isolated. The no-QoS run removes this spec's code - with nothing
-programmed the enqueue feature is not enabled on any interface, so the
-plugin never sees a packet - and the dot1q run removes 802.1ad and with it
-any effect of the af_packet TPID patch, which only rewrites the
-reconstructed ethertype when the kernel reports a TPID other than 0x8100.
-What remains is PPPoE session churn under traffic, and IPoE churning the
-same way does not crash.
+Isolated to an unmerged dependency. The no-QoS run removes this spec's
+code - with nothing programmed the enqueue feature is not enabled on any
+interface, so the plugin never sees a packet - and the dot1q run removes
+802.1ad and with it any effect of the af_packet TPID patch. What remained
+was the PPPoE plugin itself, and swapping only that `.so` settles it:
 
-**Leading hypothesis, not proven.** `osvbng_pppoe.c` creates each session's
+| PPPoE plugin | runs | result |
+|---|---|---|
+| `fix/session-sup-sw-if-index` (pppoe-control #3) | 4 | SIGSEGV every time |
+| shipped | 1 | no crash, churn completed, teardown clean |
+
+**The crash belongs to the session parentage PR this spec depends on**, not
+to shipped osvbng and not to the QoS plugin. That branch points a session
+interface's `sup_sw_if_index` at its encap sub-interface, on an interface
+created by `vnet_register_interface()` and therefore of type
+`VNET_SW_INTERFACE_TYPE_HARDWARE`, where VPP's convention is
+`sup_sw_if_index == sw_if_index`; `vnet_get_sup_sw_interface()` only
+follows the field for SUB, P2P and PIPE. The PPPoE plugin also recycles
+session interfaces through a free list rather than deleting them, so a
+reused interface is re-parented over whatever the previous parenting left.
+The IPoE equivalent (ipoe #7) does not crash under the same churn and does
+not recycle interfaces the same way.
+
+Consequence for this spec: attaching a scheduler to an S-VLAN through a
+*session* interface depends on those PRs, so pppoe-control #3 has to be
+fixed before HQoS over PPPoE sessions can ship. Nothing here needs to
+change. Filed upstream as veesix-networks/osvbng#419.
+
+**Secondary observation for whoever fixes it.** `osvbng_pppoe.c` creates each session's
 midchain adjacency (`adj_nbr_midchain_update_rewrite`,
 `adj_nbr_midchain_stack`, around :234-265) but the delete path (:490-520)
 never unstacks or releases it: the session interface is not deleted at all,
