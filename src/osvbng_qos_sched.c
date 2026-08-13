@@ -471,12 +471,23 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
   if (weight && (weight < CAKE_WEIGHT_MIN || weight > CAKE_WEIGHT_MAX))
     return VNET_API_ERROR_INVALID_VALUE;
 
+  /* One-shot config change under the barrier: both branches mutate state
+   * workers read per packet - enable may even realloc the sw_if_index
+   * lookup vector, disable frees tins a dequeue walk may be inside. The
+   * binapi path already holds the barrier and the sync is
+   * recursion-tolerant; this is for the CLI and the interface add/del
+   * callback, which arrive barrier-free. */
+  vlib_worker_thread_barrier_sync (vm);
+
   if (is_enable)
     {
       vec_validate_init_empty (cm->sched_index_by_sw_if_index, sw_if_index,
 			       ~0);
       if (cm->sched_index_by_sw_if_index[sw_if_index] != ~0)
-	return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
+	{
+	  vlib_worker_thread_barrier_release (vm);
+	  return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
+	}
 
       if (tin_mode > CAKE_TIN_MODE_DIFFSERV8)
 	tin_mode = CAKE_TIN_MODE_BESTEFFORT;
@@ -587,10 +598,16 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
   else
     {
       if (sw_if_index >= vec_len (cm->sched_index_by_sw_if_index))
-	return VNET_API_ERROR_NO_SUCH_ENTRY;
+	{
+	  vlib_worker_thread_barrier_release (vm);
+	  return VNET_API_ERROR_NO_SUCH_ENTRY;
+	}
       u32 pool_index = cm->sched_index_by_sw_if_index[sw_if_index];
       if (pool_index == ~0)
-	return VNET_API_ERROR_NO_SUCH_ENTRY;
+	{
+	  vlib_worker_thread_barrier_release (vm);
+	  return VNET_API_ERROR_NO_SUCH_ENTRY;
+	}
 
       cake_sched_t *cs = pool_elt_at_index (cm->schedulers, pool_index);
       u32 owner = cs->owner_thread;
@@ -635,6 +652,7 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 		       "scheduler disabled on sw_if_index %u", sw_if_index);
     }
 
+  vlib_worker_thread_barrier_release (vm);
   return 0;
 }
 
