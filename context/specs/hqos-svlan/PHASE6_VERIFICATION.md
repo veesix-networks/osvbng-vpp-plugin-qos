@@ -145,10 +145,34 @@ That the interface is recycled rather than deleted also explains why the
 dataplane's interface-delete hook never cleaned up PPPoE schedulers, which
 is what the teardown check caught before the IfIndex fix.
 
-Consequence for this spec: suite 52 cannot pass until that is fixed. Suite
-51 passes except for an unrelated flake where some IPoE sessions do not
-re-establish after an ungraceful kill (`max_concurrent_sessions: 1` against
-a session the BNG still holds is the untested suspect).
+Consequence for this spec: suite 52 cannot pass until that is fixed.
+
+### Open, not ours: IPoE sessions do not always come back from an ungraceful kill
+
+Suite 51 does not crash, but it fails about half its churn runs with three
+to five of six sessions re-established, at random. The QoS side stays
+correct throughout - the surviving subscribers' shares are right for the
+set of sessions that exist - so this is session re-establishment, not
+shaping.
+
+`max_concurrent_sessions` is enforced per (MAC, S-VLAN, C-VLAN) against a
+cached counter (`internal/ipoe/session.go:172`). The monkey's "restart
+without termination" method kills a DHCP session with no RELEASE, so
+nothing decrements that counter, and the reconnect from the same MAC on the
+same VLAN is refused until the old session expires - which at a 3600 s
+lease is well past the end of the run. Sessions killed gracefully come
+back; ungraceful ones do not, which is exactly the random split observed.
+Confirm on a failing run with:
+
+    docker logs <bng> 2>&1 | grep -ai "session limit"
+
+Both churn suites now leave the limit unset, because a suite that
+reconnects the same MAC as fast as a monkey can kill it is testing the AAA
+limiter rather than HQoS. The product question it raises is worth its own
+issue and is not this spec's to answer: an ungraceful CPE reboot - a power
+cut, a crash, no RELEASE sent - is the ordinary case in the field, and a
+BNG that refuses the returning subscriber until lease expiry locks them out
+for up to an hour.
 
 ## Review inventory
 
