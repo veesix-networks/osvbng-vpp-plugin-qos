@@ -118,7 +118,9 @@ tolerance). Fix: disable now requires only that the interface exist;
 enable still requires api-visibility. `tests/hidden-if-rig.sh`
 reproduces it end to end — the disable must go through the binary API by
 sw_if_index because the CLI cannot even name a hidden interface — and
-discriminates pre-fix (-2, leak) from fixed (0, drained).
+discriminates pre-fix (-2, leak) from fixed (0, drained). Confirmed on
+the lab host 2026-08-13: suite 52 green across repeated runs, all six
+disables landing.
 
 ### Open, not ours: VPP crashes under PPPoE session churn
 
