@@ -118,12 +118,13 @@ cake_tin_init (cake_tin_t *tin, u32 quantum)
 }
 
 static void
-cake_tin_drain (vlib_main_t *vm, cake_tin_t *tin)
+cake_tin_drain (vlib_main_t *vm, cake_main_t *cm, cake_sched_t *cs,
+		cake_tin_t *tin)
 {
   if (tin->flows)
     {
       for (u32 i = 0; i < CAKE_QUEUES; i++)
-	cake_flow_ring_free (vm, &tin->flows[i]);
+	cake_flow_discard (vm, cm, cs, tin, &tin->flows[i]);
       clib_mem_free (tin->flows);
       tin->flows = NULL;
     }
@@ -295,7 +296,7 @@ cake_sched_enable_disable (vlib_main_t *vm, u32 sw_if_index, u8 is_enable,
 				   sw_if_index, 0, 0, 0);
 
       for (u8 t = 0; t < cs->n_tins; t++)
-	cake_tin_drain (vm, &cs->tins[t]);
+	cake_tin_drain (vm, cm, cs, &cs->tins[t]);
       clib_mem_free (cs->tins);
       cs->tins = NULL;
 
