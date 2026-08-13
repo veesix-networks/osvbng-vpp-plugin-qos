@@ -158,8 +158,10 @@ CL-2 (AQM re-entry under closed gates) is recorded, unfixed, and needs a
 bottlenecked rig to evaluate.
 
 What remains before merge:
-- §9.4 containerlab suites 18/19 — needs a dataplane image and clab, not
-  runnable in this workspace.
+- §9.4 containerlab suites 18/19 — PASSED 2026-08-13 on an external lab
+  host (see PHASE6_VERIFICATION.md §9.4 for the four defects found on the
+  way, none in this spec's code). An aggregate-under-sessions suite and
+  multi-worker coverage remain open.
 - qos #4/#5/#6/#7 merging in the stacked order
   (fix/aggregate-shaper-correctness); this branch rebases if they change.
 - Session parentage: osvbng-vpp-plugin-ipoe #7, pppoe-control #3. All

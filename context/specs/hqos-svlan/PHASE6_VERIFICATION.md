@@ -45,6 +45,43 @@ at every load point, no memory growth observed across phases, and the
 number the spec demanded exists. The §10 batching debt (Requirement #2) is
 unchanged and remains its own issue.
 
+## §9.4 containerlab (2026-08-13, external lab host)
+
+Suites 18 and 19 run green on a fresh x86_64 containerlab host with the
+image built from `feat/hqos-svlan-control-plane`: the refreshed qos, ipoe
+and pppoe plugins (the latter two from their `fix/session-sup-sw-if-index`
+branches) plus a patched `af_packet_plugin.so`. Suite 19 passing is the
+first live validation of the whole new chain: a QinQ 802.1ad IPoE session,
+AAA service-group resolution, and a CAKE scheduler applied to a *session*
+interface through the `_v2` weighted message, resolving its attachment
+through the new session parentage. The `osvbng_cake_capabilities`
+handshake was also observed live (`svlan_tier=true weighted_drr=true`).
+
+Getting there surfaced four defects, none in this spec's code:
+
+1. **bngtester vs suite configs** — current `bngtester:alpine-latest`
+   builds its QinQ stack with an 802.1ad outer tag while all 85 suite
+   configs pinned `vlan-tpid: dot1q`; CI stays green only because its
+   runners cache a stale image. Suites 18/19 flipped to dot1ad on the
+   branch.
+2. **VPP af_packet RX discards the kernel-reported VLAN TPID** and
+   reconstructs stripped tags as 0x8100, so dot1ad sub-interfaces can
+   never match behind af_packet (on veth the kernel strips the outer tag
+   into metadata unconditionally). Fixed by
+   `osvbng-vpp/patches/0001-af-packet-honour-rx-vlan-tpid.patch`,
+   upstream-first; the patched plugin ships via `test-infra/`.
+3. **Suite 19 bound its service group to a dead config key** (`service-group`
+   on the aaa policy, which `AAAPolicy` has no field for), so sessions had
+   no service group and the scheduler block was never reached. Rebound via
+   `default-service-group` on the subscriber-group; suites 25/30 carry the
+   same dead key upstream.
+4. The osvbng image lacks `ethtool`/`tcpdump`, which made the wire-level
+   debugging above needlessly indirect.
+
+Still unrun: an S-VLAN aggregate under a *session* topology (no suite
+configures `qos-aggregate` yet — a suite-19 variant with two S-VLANs is
+the natural follow-up), and everything multi-worker.
+
 ## Review inventory
 
 | artifact | lens | reviewer | findings |
